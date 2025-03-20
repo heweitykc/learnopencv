@@ -13,6 +13,7 @@ import android.graphics.PorterDuff;
 import android.graphics.PorterDuffXfermode;
 import android.graphics.Rect;
 import android.net.Uri;
+import android.os.Build;
 import android.provider.MediaStore;
 import android.util.Log;
 
@@ -26,6 +27,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+
+import android.media.ExifInterface;
 
 /**
  * 图像处理工具类
@@ -65,10 +68,17 @@ public class ImageUtils {
             input.close();
         }
 
-        // 检查图像方向并纠正
-        String imagePath = getPathFromUri(context, imageUri);
-        if (imagePath != null) {
-            bitmap = fixImageOrientation(bitmap, imagePath);
+        // 不再尝试从文件路径读取EXIF信息
+        // 而是直接使用ExifInterface处理InputStream
+        try (InputStream exifStream = context.getContentResolver().openInputStream(imageUri)) {
+            if (exifStream != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                ExifInterface exif = new ExifInterface(exifStream);
+                int orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, 
+                                                     ExifInterface.ORIENTATION_NORMAL);
+                bitmap = fixOrientation(bitmap, orientation);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "读取EXIF信息失败: " + e.getMessage());
         }
 
         return bitmap;
@@ -145,47 +155,34 @@ public class ImageUtils {
     /**
      * 根据EXIF信息修正图像方向
      */
-    private static Bitmap fixImageOrientation(Bitmap bitmap, String imagePath) {
-        int orientation = getExifOrientation(imagePath);
-        if (orientation > 0) {
-            Matrix matrix = new Matrix();
-            switch (orientation) {
-                case 3: // 180°
-                    matrix.postRotate(180);
-                    break;
-                case 6: // 90°
-                    matrix.postRotate(90);
-                    break;
-                case 8: // 270°
-                    matrix.postRotate(270);
-                    break;
-            }
-            try {
-                Bitmap rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
-                if (rotatedBitmap != bitmap) {
-                    bitmap.recycle();
-                    bitmap = rotatedBitmap;
-                }
-            } catch (OutOfMemoryError e) {
-                Log.e(TAG, "旋转图像内存不足: " + e.getMessage());
-            }
+    private static Bitmap fixOrientation(Bitmap bitmap, int orientation) {
+        Matrix matrix = new Matrix();
+        switch (orientation) {
+            case ExifInterface.ORIENTATION_ROTATE_90:
+                matrix.postRotate(90);
+                break;
+            case ExifInterface.ORIENTATION_ROTATE_180:
+                matrix.postRotate(180);
+                break;
+            case ExifInterface.ORIENTATION_ROTATE_270:
+                matrix.postRotate(270);
+                break;
+            default:
+                return bitmap;
         }
-        return bitmap;
-    }
-
-    /**
-     * 获取图像的EXIF方向信息
-     */
-    private static int getExifOrientation(String imagePath) {
-        android.media.ExifInterface exif;
+        
         try {
-            exif = new android.media.ExifInterface(imagePath);
-            return exif.getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION,
-                    android.media.ExifInterface.ORIENTATION_NORMAL);
-        } catch (IOException e) {
-            Log.e(TAG, "读取EXIF信息失败: " + e.getMessage());
-            return 0;
+            Bitmap rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, 
+                                   bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+            if (rotatedBitmap != bitmap) {
+                bitmap.recycle();
+                return rotatedBitmap;
+            }
+        } catch (OutOfMemoryError e) {
+            Log.e(TAG, "旋转图像内存不足: " + e.getMessage());
         }
+        
+        return bitmap;
     }
 
     /**

@@ -7,6 +7,11 @@
     <!-- 存储权限 -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <!-- 针对Android 10+的特殊存储权限 -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" 
+        tools:ignore="ScopedStorage" />
+    <!-- 以下是Android 11+访问其他应用媒体文件的权限 -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <!-- 相机硬件功能 -->
     <uses-feature android:name="android.hardware.camera" android:required="true" />
 

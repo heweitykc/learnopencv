@@ -52,9 +52,22 @@ public class ModelHandler {
         Tensor inputTensor = TensorImageUtils.bitmapToFloat32Tensor(
                 resizedBitmap, NORM_MEAN, NORM_STD);
 
-        // 执行推理
-        Map<String, IValue> outputs = model.forward(IValue.from(inputTensor)).toDictStringKey();
-        return outputs.get("out").toTensor();
+        // 修改这里：执行推理，现在模型直接返回Tensor而非字典
+        try {
+            // 新代码：直接处理Tensor输出
+            return model.forward(IValue.from(inputTensor)).toTensor();
+        } catch (RuntimeException e) {
+            Log.e(TAG, "推理错误: " + e.getMessage());
+            
+            // 尝试兼容处理：检查是否仍是字典输出
+            try {
+                Map<String, IValue> outputs = model.forward(IValue.from(inputTensor)).toDictStringKey();
+                return outputs.get("out").toTensor();
+            } catch (Exception e2) {
+                Log.e(TAG, "兼容处理也失败: " + e2.getMessage());
+                throw e; // 抛出原始异常
+            }
+        }
     }
 
     // 辅助方法：从assets复制文件到可访问位置

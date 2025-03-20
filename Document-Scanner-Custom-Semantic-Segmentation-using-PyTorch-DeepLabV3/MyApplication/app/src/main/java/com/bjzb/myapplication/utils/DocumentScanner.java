@@ -29,6 +29,7 @@ public class DocumentScanner {
         // 获取模型输出尺寸
         long[] shape = outputTensor.shape();
 
+        // 以下代码处理直接的Tensor输出，不再需要从字典中提取
         // 转换Tensor为OpenCV Mat
         FloatBuffer buffer = FloatBuffer.allocate((int)(shape[1] * shape[2] * shape[3]));
         outputTensor.getDataAsFloatArray();
