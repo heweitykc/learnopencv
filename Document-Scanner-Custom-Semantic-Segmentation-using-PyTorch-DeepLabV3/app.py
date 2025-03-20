@@ -1,3 +1,20 @@
+import sys
+import types
+
+# 防止 torch._classes.__path__ 访问错误
+class PathPatch:
+    def __init__(self):
+        self._path = []
+
+# 修补可能导致问题的模块
+if 'torch._classes' in sys.modules:
+    torch_classes = sys.modules['torch._classes']
+    torch_classes.__path__ = PathPatch()
+
+# 确保这是第一个 streamlit 命令
+import streamlit as st
+st.set_page_config(initial_sidebar_state="collapsed")
+
 import os
 import gc
 import io
@@ -6,13 +23,10 @@ import base64
 import pathlib
 import numpy as np
 from PIL import Image
-import streamlit as st
-from streamlit_drawable_canvas import st_canvas
 
 import torch
 import torchvision.transforms as torchvision_T
 from torchvision.models.segmentation import deeplabv3_resnet50, deeplabv3_mobilenet_v3_large
-
 
 @st.cache(allow_output_mutation=True)
 def load_model(num_classes=2, model_name="mbv3", device=torch.device("cpu")):
@@ -211,8 +225,6 @@ preprocess_transforms = image_preprocess_transforms()
 image = None
 final = None
 result = None
-
-st.set_page_config(initial_sidebar_state="collapsed")
 
 st.title("Document Scanner: Semantic Segmentation using DeepLabV3-PyTorch")
 
