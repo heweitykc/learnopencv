@@ -10,6 +10,7 @@ import org.opencv.core.Mat;
 import org.opencv.core.MatOfPoint;
 import org.opencv.core.MatOfPoint2f;
 import org.opencv.core.Point;
+import org.opencv.core.Rect;
 import org.opencv.core.Size;
 import org.opencv.imgproc.Imgproc;
 import org.pytorch.Tensor;
@@ -24,80 +25,131 @@ import java.util.List;
 public class DocumentScanner {
     private static final String TAG = "DocumentScanner";
 
+    // 添加一个静态变量存储最后一次处理的掩码
+    private static Bitmap lastMaskBitmap = null;
+
+    // 添加getter方法
+    public static Bitmap getLastMaskBitmap() {
+        return lastMaskBitmap;
+    }
+
     // 处理模型输出并检测文档边缘
     public static Bitmap processModelOutput(Bitmap originalImage, Tensor outputTensor) {
-        // 获取模型输出尺寸
-        long[] shape = outputTensor.shape();
+        try {
+            // 获取模型输出尺寸
+            long[] shape = outputTensor.shape();
+            Log.d(TAG, "模型输出尺寸: " + Arrays.toString(shape));
+            
+            // 转换Tensor为OpenCV Mat
+            FloatBuffer buffer = FloatBuffer.allocate((int)(shape[0] * shape[1] * shape[2]));
+            outputTensor.getDataAsFloatArray();
+            
+            // 创建分割掩码 - 修改为确保尺寸匹配
+            int maskHeight = (int)shape[1];
+            int maskWidth = (int)shape[2];
+            Mat segmentationMask = new Mat(maskHeight, maskWidth, CvType.CV_32F);
+            
+            // 添加调试信息
+            Log.d(TAG, "掩码尺寸: " + segmentationMask.size().toString());
+            Log.d(TAG, "原始图像尺寸: " + originalImage.getWidth() + "x" + originalImage.getHeight());
+            
+            // 处理数据 - 使用最大类别索引
+            for (int y = 0; y < maskHeight; y++) {
+                for (int x = 0; x < maskWidth; x++) {
+                    float val0 = buffer.get(y * maskWidth + x);
+                    float val1 = buffer.get(maskHeight * maskWidth + y * maskWidth + x);
+                    // 如果类别1的值大于类别0，则认为是文档
+                    float value = (val1 > val0) ? 1.0f : 0.0f;
+                    segmentationMask.put(y, x, value);
+                }
+            }
+            
+            // 转换为8位图像 - 确保值范围正确
+            Mat mask8U = new Mat();
+            segmentationMask.convertTo(mask8U, CvType.CV_8U, 255.0);
+            
+            // 保存中间结果用于调试
+            Bitmap maskBitmap = Bitmap.createBitmap(maskWidth, maskHeight, Bitmap.Config.ARGB_8888);
+            Utils.matToBitmap(mask8U, maskBitmap);
+            
+            // 存储掩码位图用于调试
+            lastMaskBitmap = maskBitmap;
+            
+            // 降低边缘检测阈值
+            Mat edges = new Mat();
+            Imgproc.Canny(mask8U, edges, 50, 150); // 降低阈值，更容易检测边缘
+            
+            // 使用更大的内核进行膨胀
+            Mat dilatedEdges = new Mat();
+            Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(7, 7));
+            Imgproc.dilate(edges, dilatedEdges, kernel);
+            
+            // 查找轮廓
+            List<MatOfPoint> contours = new ArrayList<>();
+            Mat hierarchy = new Mat();
+            Imgproc.findContours(dilatedEdges.clone(), contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+            
+            // 添加额外日志
+            Log.d(TAG, "找到轮廓数量: " + contours.size());
+            
+            // 如果没有找到轮廓
+            if (contours.isEmpty()) {
+                Log.e(TAG, "No contours found 2");
+                return originalImage;
+            }
+            
+            // 按面积排序，获取最大轮廓
+            MatOfPoint largestContour = Collections.max(contours, new Comparator<MatOfPoint>() {
+                @Override
+                public int compare(MatOfPoint o1, MatOfPoint o2) {
+                    return Double.compare(Imgproc.contourArea(o1), Imgproc.contourArea(o2));
+                }
+            });
+            
+            // 简化轮廓 - 调整epsilon值使其更宽松
+            MatOfPoint2f approxCurve = new MatOfPoint2f();
+            MatOfPoint2f contour2f = new MatOfPoint2f(largestContour.toArray());
+            double epsilon = 0.05 * Imgproc.arcLength(contour2f, true); // 增大epsilon
+            Imgproc.approxPolyDP(contour2f, approxCurve, epsilon, true);
+            
+            // 获取角点并打印
+            Point[] corners = approxCurve.toArray();
+            Log.d(TAG, "角点数量: " + corners.length);
+            
+            // 如果角点不是四个，尝试强制创建矩形
+            if (corners.length != 4) {
+                Log.w(TAG, "未找到四个角点，使用边界矩形");
+                Rect boundingRect = Imgproc.boundingRect(largestContour);
+                corners = new Point[4];
+                corners[0] = new Point(boundingRect.x, boundingRect.y); // 左上
+                corners[1] = new Point(boundingRect.x + boundingRect.width, boundingRect.y); // 右上
+                corners[2] = new Point(boundingRect.x + boundingRect.width, boundingRect.y + boundingRect.height); // 右下
+                corners[3] = new Point(boundingRect.x, boundingRect.y + boundingRect.height); // 左下
+            }
+            
+            // 调整输出尺寸与原图一致
+            float scaleX = (float) originalImage.getWidth() / 384;
+            float scaleY = (float) originalImage.getHeight() / 384;
 
-        // 以下代码处理直接的Tensor输出，不再需要从字典中提取
-        // 转换Tensor为OpenCV Mat
-        FloatBuffer buffer = FloatBuffer.allocate((int)(shape[1] * shape[2] * shape[3]));
-        outputTensor.getDataAsFloatArray();
+            // 调整角点坐标
+            for (int i = 0; i < corners.length; i++) {
+                corners[i].x *= scaleX;
+                corners[i].y *= scaleY;
+            }
 
-        // 创建分割掩码
-        Mat segmentationMask = new Mat((int)shape[2], (int)shape[3], CvType.CV_32F);
-        // 处理输出创建二值掩码 (类似Python代码中的torch.argmax操作)
-        processTensorToMask(buffer.array(), segmentationMask, (int)shape[2], (int)shape[3], (int)shape[1]);
+            // 对角点排序
+            corners = orderPoints(corners);
 
-        // 转换为8位图像
-        Mat mask8U = new Mat();
-        segmentationMask.convertTo(mask8U, CvType.CV_8U, 255.0);
+            // 计算目标角点
+            Point[] destCorners = findDestination(corners);
 
-        // Canny边缘检测
-        Mat edges = new Mat();
-        Imgproc.Canny(mask8U, edges, 225, 255);
-
-        // 膨胀边缘
-        Mat dilatedEdges = new Mat();
-        Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, new Size(5, 5));
-        Imgproc.dilate(edges, dilatedEdges, kernel);
-
-        // 查找轮廓
-        List<MatOfPoint> contours = new ArrayList<>();
-        Mat hierarchy = new Mat();
-        Imgproc.findContours(dilatedEdges, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_NONE);
-
-        // 如果没有找到轮廓
-        if (contours.isEmpty()) {
-            Log.e(TAG, "No contours found");
+            // 执行透视变换
+            return performPerspectiveTransform(originalImage, corners, destCorners);
+        } catch (Exception e) {
+            Log.e(TAG, "文档扫描错误: " + e.getMessage());
+            e.printStackTrace();
             return originalImage;
         }
-
-        // 按面积排序，获取最大轮廓
-        MatOfPoint largestContour = Collections.max(contours, Comparator.comparing(Imgproc::contourArea));
-
-        // 简化轮廓
-        MatOfPoint2f approxCurve = new MatOfPoint2f();
-        MatOfPoint2f contour2f = new MatOfPoint2f(largestContour.toArray());
-        double epsilon = 0.02 * Imgproc.arcLength(contour2f, true);
-        Imgproc.approxPolyDP(contour2f, approxCurve, epsilon, true);
-
-        // 获取角点
-        Point[] corners = approxCurve.toArray();
-        if (corners.length != 4) {
-            Log.w(TAG, "Document corners not found correctly. Found: " + corners.length);
-            // 尝试矫正或返回原图
-            return originalImage;
-        }
-
-        // 调整输出尺寸与原图一致
-        float scaleX = (float) originalImage.getWidth() / 384;
-        float scaleY = (float) originalImage.getHeight() / 384;
-
-        // 调整角点坐标
-        for (int i = 0; i < corners.length; i++) {
-            corners[i].x *= scaleX;
-            corners[i].y *= scaleY;
-        }
-
-        // 对角点排序
-        corners = orderPoints(corners);
-
-        // 计算目标角点
-        Point[] destCorners = findDestination(corners);
-
-        // 执行透视变换
-        return performPerspectiveTransform(originalImage, corners, destCorners);
     }
 
     // 以下是辅助方法，实现与Python代码相同的功能

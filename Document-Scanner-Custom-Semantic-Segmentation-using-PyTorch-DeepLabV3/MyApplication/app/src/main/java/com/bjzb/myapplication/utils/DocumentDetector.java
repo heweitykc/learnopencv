@@ -62,7 +62,7 @@ public class DocumentDetector {
 
         // 如果没有找到轮廓，返回null
         if (contours.isEmpty()) {
-            Log.d(TAG, "No contours found");
+            Log.d(TAG, "No contours found 1");
             return null;
         }
 

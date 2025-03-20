@@ -31,6 +31,7 @@ public class ResultActivity extends AppCompatActivity {
 
     private ImageView ivOriginal;
     private ImageView ivProcessed;
+    private ImageView ivMask;
     private ProgressBar progressBar;
     private Button btnSave;
 
@@ -50,6 +51,7 @@ public class ResultActivity extends AppCompatActivity {
 
         ivOriginal = findViewById(R.id.ivOriginal);
         ivProcessed = findViewById(R.id.ivProcessed);
+        ivMask = findViewById(R.id.ivMask);
         progressBar = findViewById(R.id.progressBar);
         btnSave = findViewById(R.id.btnSave);
 
@@ -112,6 +114,14 @@ public class ResultActivity extends AppCompatActivity {
                         @Override
                         public void run() {
                             ivProcessed.setImageBitmap(processedBitmap);
+                            
+                            // 获取并显示掩码图像
+                            Bitmap maskBitmap = DocumentScanner.getLastMaskBitmap();
+                            if (maskBitmap != null) {
+                                ivMask.setVisibility(View.VISIBLE);
+                                ivMask.setImageBitmap(maskBitmap);
+                            }
+                            
                             progressBar.setVisibility(View.GONE);
                             btnSave.setEnabled(true);
                         }
