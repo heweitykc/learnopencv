@@ -105,7 +105,10 @@ public class ResultActivity extends AppCompatActivity {
                 try {
                     // 运行模型推理
                     final Tensor outputTensor = modelHandler.runInference(originalBitmap);
-
+                    
+                    // 输出Tensor信息用于调试
+                    Log.d(TAG, "模型输出信息: " + modelHandler.printTensorInfo(outputTensor));
+                    
                     // 处理输出并获取扫描结果
                     processedBitmap = DocumentScanner.processModelOutput(originalBitmap, outputTensor);
 

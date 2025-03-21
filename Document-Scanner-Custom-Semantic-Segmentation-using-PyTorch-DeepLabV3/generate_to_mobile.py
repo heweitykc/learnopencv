@@ -48,7 +48,7 @@ def convert_model(model_path, output_path, model_name="mbv3"):
     print(f"模型大小: {size_mb:.2f} MB")
 
 # 转换MobileNetV3模型
-convert_model("model_mbv3_iou_mix_2C049.pth", "doc_scanner_mbv3.pt", "mbv3")
+# convert_model("model_mbv3_iou_mix_2C049.pth", "doc_scanner_mbv3.pt", "mbv3")
 
 # 可选: 转换ResNet50模型
-# convert_model("model_r50_iou_mix_2C020.pth", "doc_scanner_r50.pt", "r50")
+convert_model("model_r50_iou_mix_2C020.pth", "doc_scanner_r50.pt", "r50")

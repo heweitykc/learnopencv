@@ -5,6 +5,7 @@ import android.graphics.Matrix;
 import android.util.Log;
 
 import org.opencv.android.Utils;
+import org.opencv.core.Core;
 import org.opencv.core.CvType;
 import org.opencv.core.Mat;
 import org.opencv.core.MatOfPoint;
@@ -41,110 +42,93 @@ public class DocumentScanner {
             Log.d(TAG, "模型输出尺寸: " + Arrays.toString(shape));
             
             // 转换Tensor为OpenCV Mat
-            FloatBuffer buffer = FloatBuffer.allocate((int)(shape[0] * shape[1] * shape[2]));
-            outputTensor.getDataAsFloatArray();
+            float[] dataArray = outputTensor.getDataAsFloatArray();
+            Log.d(TAG, "输出数据大小: " + dataArray.length);
             
-            // 创建分割掩码 - 修改为确保尺寸匹配
-            int maskHeight = (int)shape[1];
-            int maskWidth = (int)shape[2];
+            // 根据shape分析输出结构
+            int maskHeight, maskWidth;
+            if (shape.length == 4) { // 通常是[1, C, H, W]或[1, H, W, C]格式
+                // 假设格式为[1, C, H, W]
+                maskHeight = (int)shape[2];
+                maskWidth = (int)shape[3];
+            } else if (shape.length == 3) { // 可能是[C, H, W]
+                maskHeight = (int)shape[1];
+                maskWidth = (int)shape[2];
+            } else {
+                Log.e(TAG, "无法理解的模型输出形状: " + Arrays.toString(shape));
+                return originalImage;
+            }
+            
+            Log.d(TAG, "掩码尺寸: " + maskHeight + "x" + maskWidth);
+            
+            // 创建分割掩码
             Mat segmentationMask = new Mat(maskHeight, maskWidth, CvType.CV_32F);
             
-            // 添加调试信息
-            Log.d(TAG, "掩码尺寸: " + segmentationMask.size().toString());
-            Log.d(TAG, "原始图像尺寸: " + originalImage.getWidth() + "x" + originalImage.getHeight());
-            
-            // 处理数据 - 使用最大类别索引
+            // 改用简单的阈值方法处理 - 直接使用第一个通道
+            // 对于二分类问题，可以假设第一个通道的值越大越可能是背景，越小越可能是文档
             for (int y = 0; y < maskHeight; y++) {
                 for (int x = 0; x < maskWidth; x++) {
-                    float val0 = buffer.get(y * maskWidth + x);
-                    float val1 = buffer.get(maskHeight * maskWidth + y * maskWidth + x);
-                    // 如果类别1的值大于类别0，则认为是文档
-                    float value = (val1 > val0) ? 1.0f : 0.0f;
-                    segmentationMask.put(y, x, value);
+                    int idx = y * maskWidth + x;
+                    // 如果只有一个通道，直接用它
+                    if (dataArray.length == maskHeight * maskWidth) {
+                        float value = dataArray[idx];
+                        // 使用阈值0.5（如果模型输出是sigmoid/softmax的话）
+                        segmentationMask.put(y, x, value > 0.5f ? 1.0f : 0.0f);
+                    }
+                    // 如果有两个通道，比较它们
+                    else if (dataArray.length >= maskHeight * maskWidth * 2) {
+                        try {
+                            float val0 = dataArray[idx]; // 第一个通道
+                            float val1 = dataArray[maskHeight * maskWidth + idx]; // 第二个通道
+                            float value = (val1 > val0) ? 1.0f : 0.0f;
+                            segmentationMask.put(y, x, value);
+                        } catch (IndexOutOfBoundsException e) {
+                            // 索引错误，输出更多调试信息
+                            Log.e(TAG, "索引越界: " + e.getMessage() + 
+                                  ", 位置["+y+","+x+"], 总大小="+dataArray.length);
+                            return originalImage;
+                        }
+                    }
+                    // 否则无法处理
+                    else {
+                        Log.e(TAG, "未知的输出格式: 数据长度=" + dataArray.length + 
+                              " 但掩码大小=" + (maskHeight * maskWidth));
+                        return originalImage;
+                    }
                 }
             }
             
-            // 转换为8位图像 - 确保值范围正确
+            // 添加调试信息
+            Log.d(TAG, "掩码值范围: " + Core.minMaxLoc(segmentationMask).minVal +
+                  " 到 " + Core.minMaxLoc(segmentationMask).maxVal);
+            
+            // 转换为8位图像
             Mat mask8U = new Mat();
             segmentationMask.convertTo(mask8U, CvType.CV_8U, 255.0);
             
             // 保存中间结果用于调试
             Bitmap maskBitmap = Bitmap.createBitmap(maskWidth, maskHeight, Bitmap.Config.ARGB_8888);
             Utils.matToBitmap(mask8U, maskBitmap);
+            lastMaskBitmap = maskBitmap; // 假设您添加了这个静态字段
             
-            // 存储掩码位图用于调试
-            lastMaskBitmap = maskBitmap;
+            // 应用膨胀操作改善掩码
+            Mat dilatedMask = new Mat();
+            Mat dilationKernel = Imgproc.getStructuringElement(
+                    Imgproc.MORPH_ELLIPSE, new Size(5, 5));
+            Imgproc.dilate(mask8U, dilatedMask, dilationKernel);
             
-            // 降低边缘检测阈值
-            Mat edges = new Mat();
-            Imgproc.Canny(mask8U, edges, 50, 150); // 降低阈值，更容易检测边缘
+            // 使用DocumentDetector中的方法来处理掩码
+            Point[] documentCorners = DocumentDetector.detectDocumentFromMask(
+                    dilatedMask, originalImage.getWidth(), originalImage.getHeight());
             
-            // 使用更大的内核进行膨胀
-            Mat dilatedEdges = new Mat();
-            Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(7, 7));
-            Imgproc.dilate(edges, dilatedEdges, kernel);
-            
-            // 查找轮廓
-            List<MatOfPoint> contours = new ArrayList<>();
-            Mat hierarchy = new Mat();
-            Imgproc.findContours(dilatedEdges.clone(), contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
-            
-            // 添加额外日志
-            Log.d(TAG, "找到轮廓数量: " + contours.size());
-            
-            // 如果没有找到轮廓
-            if (contours.isEmpty()) {
-                Log.e(TAG, "No contours found 2");
+            // 如果检测到文档角点，应用透视变换
+            if (documentCorners != null && documentCorners.length == 4) {
+                return applyPerspectiveTransform(originalImage, documentCorners);
+            } else {
+                Log.e(TAG, "未能检测到文档角点");
                 return originalImage;
             }
             
-            // 按面积排序，获取最大轮廓
-            MatOfPoint largestContour = Collections.max(contours, new Comparator<MatOfPoint>() {
-                @Override
-                public int compare(MatOfPoint o1, MatOfPoint o2) {
-                    return Double.compare(Imgproc.contourArea(o1), Imgproc.contourArea(o2));
-                }
-            });
-            
-            // 简化轮廓 - 调整epsilon值使其更宽松
-            MatOfPoint2f approxCurve = new MatOfPoint2f();
-            MatOfPoint2f contour2f = new MatOfPoint2f(largestContour.toArray());
-            double epsilon = 0.05 * Imgproc.arcLength(contour2f, true); // 增大epsilon
-            Imgproc.approxPolyDP(contour2f, approxCurve, epsilon, true);
-            
-            // 获取角点并打印
-            Point[] corners = approxCurve.toArray();
-            Log.d(TAG, "角点数量: " + corners.length);
-            
-            // 如果角点不是四个，尝试强制创建矩形
-            if (corners.length != 4) {
-                Log.w(TAG, "未找到四个角点，使用边界矩形");
-                Rect boundingRect = Imgproc.boundingRect(largestContour);
-                corners = new Point[4];
-                corners[0] = new Point(boundingRect.x, boundingRect.y); // 左上
-                corners[1] = new Point(boundingRect.x + boundingRect.width, boundingRect.y); // 右上
-                corners[2] = new Point(boundingRect.x + boundingRect.width, boundingRect.y + boundingRect.height); // 右下
-                corners[3] = new Point(boundingRect.x, boundingRect.y + boundingRect.height); // 左下
-            }
-            
-            // 调整输出尺寸与原图一致
-            float scaleX = (float) originalImage.getWidth() / 384;
-            float scaleY = (float) originalImage.getHeight() / 384;
-
-            // 调整角点坐标
-            for (int i = 0; i < corners.length; i++) {
-                corners[i].x *= scaleX;
-                corners[i].y *= scaleY;
-            }
-
-            // 对角点排序
-            corners = orderPoints(corners);
-
-            // 计算目标角点
-            Point[] destCorners = findDestination(corners);
-
-            // 执行透视变换
-            return performPerspectiveTransform(originalImage, corners, destCorners);
         } catch (Exception e) {
             Log.e(TAG, "文档扫描错误: " + e.getMessage());
             e.printStackTrace();
@@ -256,35 +240,96 @@ public class DocumentScanner {
         return dst;
     }
 
-    // 执行透视变换
-    private static Bitmap performPerspectiveTransform(Bitmap originalImage, Point[] srcPoints, Point[] dstPoints) {
-        // 创建源和目标角点矩阵
-        Mat src = new Mat(4, 1, CvType.CV_32FC2);
-        Mat dst = new Mat(4, 1, CvType.CV_32FC2);
+    /**
+     * 执行透视变换
+     * @param originalImage 原始图像
+     * @param corners 文档四个角点
+     * @return 透视校正后的图像
+     */
+    private static Bitmap applyPerspectiveTransform(Bitmap originalImage, Point[] corners) {
+        try {
+            // 确保有四个角点
+            if (corners == null || corners.length != 4) {
+                Log.e(TAG, "透视变换需要四个角点");
+                return originalImage;
+            }
 
-        for (int i = 0; i < 4; i++) {
-            src.put(i, 0, new double[] { srcPoints[i].x, srcPoints[i].y });
-            dst.put(i, 0, new double[] { dstPoints[i].x, dstPoints[i].y });
+            // 将角点排序为: 左上, 右上, 右下, 左下
+            corners = orderPoints(corners);
+
+            // 计算目标尺寸
+            double width1 = Math.sqrt(Math.pow(corners[1].x - corners[0].x, 2) + Math.pow(corners[1].y - corners[0].y, 2));
+            double width2 = Math.sqrt(Math.pow(corners[2].x - corners[3].x, 2) + Math.pow(corners[2].y - corners[3].y, 2));
+            double maxWidth = Math.max(width1, width2);
+
+            double height1 = Math.sqrt(Math.pow(corners[3].x - corners[0].x, 2) + Math.pow(corners[3].y - corners[0].y, 2));
+            double height2 = Math.sqrt(Math.pow(corners[2].x - corners[1].x, 2) + Math.pow(corners[2].y - corners[1].y, 2));
+            double maxHeight = Math.max(height1, height2);
+
+            // 创建目标角点
+            MatOfPoint2f dstPoints = new MatOfPoint2f(
+                    new Point(0, 0),                   // 左上
+                    new Point(maxWidth - 1, 0),        // 右上
+                    new Point(maxWidth - 1, maxHeight - 1), // 右下
+                    new Point(0, maxHeight - 1)        // 左下
+            );
+
+            // 创建源角点
+            MatOfPoint2f srcPoints = new MatOfPoint2f(corners);
+
+            // 计算透视变换矩阵
+            Mat perspectiveMatrix = Imgproc.getPerspectiveTransform(srcPoints, dstPoints);
+
+            // 将原始图像转换为Mat
+            Mat srcMat = new Mat();
+            Utils.bitmapToMat(originalImage, srcMat);
+
+            // 创建目标Mat
+            Mat dstMat = new Mat((int) maxHeight, (int) maxWidth, srcMat.type());
+
+            // 执行透视变换
+            Imgproc.warpPerspective(srcMat, dstMat, perspectiveMatrix, dstMat.size());
+
+            // 将结果转换回Bitmap
+            Bitmap resultBitmap = Bitmap.createBitmap((int) maxWidth, (int) maxHeight, Bitmap.Config.ARGB_8888);
+            Utils.matToBitmap(dstMat, resultBitmap);
+
+            // 释放资源
+            srcMat.release();
+            dstMat.release();
+            perspectiveMatrix.release();
+
+            return resultBitmap;
+        } catch (Exception e) {
+            Log.e(TAG, "透视变换错误: " + e.getMessage());
+            e.printStackTrace();
+            return originalImage;
         }
+    }
 
-        // 计算透视变换矩阵
-        Mat perspectiveMatrix = Imgproc.getPerspectiveTransform(src, dst);
+    /**
+     * 获取数组最小值索引
+     */
+    private static int minIndex(double[] arr) {
+        int minIdx = 0;
+        for (int i = 1; i < arr.length; i++) {
+            if (arr[i] < arr[minIdx]) {
+                minIdx = i;
+            }
+        }
+        return minIdx;
+    }
 
-        // 创建原始图像的Mat
-        Mat inputMat = new Mat();
-        Utils.bitmapToMat(originalImage, inputMat);
-
-        // 创建输出Mat
-        Mat outputMat = new Mat((int)dstPoints[2].y, (int)dstPoints[2].x, CvType.CV_8UC3);
-
-        // 执行透视变换
-        Imgproc.warpPerspective(inputMat, outputMat, perspectiveMatrix, outputMat.size(),
-                Imgproc.INTER_LANCZOS4);
-
-        // 转换回Bitmap
-        Bitmap resultBitmap = Bitmap.createBitmap(outputMat.cols(), outputMat.rows(), Bitmap.Config.ARGB_8888);
-        Utils.matToBitmap(outputMat, resultBitmap);
-
-        return resultBitmap;
+    /**
+     * 获取数组最大值索引
+     */
+    private static int maxIndex(double[] arr) {
+        int maxIdx = 0;
+        for (int i = 1; i < arr.length; i++) {
+            if (arr[i] > arr[maxIdx]) {
+                maxIdx = i;
+            }
+        }
+        return maxIdx;
     }
 }

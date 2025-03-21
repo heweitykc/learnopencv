@@ -14,11 +14,14 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Arrays;
 import java.util.Map;
 
 public class ModelHandler {
     private static final String TAG = "ModelHandler";
-    private static final String MODEL_NAME = "doc_scanner_mbv3.pt";
+//    private static final String MODEL_NAME = "doc_scanner_mbv3.pt";
+    private static final String MODEL_NAME = "doc_scanner_r50.pt";
+//    private static final String MODEL_NAME = "doc_scanner_mbv3_quantized.pt";
 
     // 归一化参数 (与Python一致)
     private static final float[] NORM_MEAN = new float[]{0.4611f, 0.4359f, 0.3905f};
@@ -88,5 +91,28 @@ public class ModelHandler {
             }
             return file.getAbsolutePath();
         }
+    }
+
+    // 添加这个方法用于检查输出Tensor的结构
+    public String printTensorInfo(Tensor tensor) {
+        if (tensor == null) return "Tensor is null";
+        
+        long[] shape = tensor.shape();
+        float[] data = tensor.getDataAsFloatArray();
+        
+        StringBuilder info = new StringBuilder();
+        info.append("Tensor shape: ").append(Arrays.toString(shape)).append("\n");
+        info.append("Data length: ").append(data.length).append("\n");
+        
+        // 计算数据范围
+        float min = Float.MAX_VALUE;
+        float max = Float.MIN_VALUE;
+        for (float v : data) {
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        info.append("Value range: ").append(min).append(" to ").append(max);
+        
+        return info.toString();
     }
 }
