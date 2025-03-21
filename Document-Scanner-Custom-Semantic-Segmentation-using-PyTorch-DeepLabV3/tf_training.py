@@ -28,7 +28,7 @@ NUM_CLASSES = 2  # 背景和文档
 # - masks/ 包含所有掩码 (二值化: 0=背景, 1=文档)
 
 # 1. 数据准备
-def get_dataset_paths(images_dir='images', masks_dir='masks'):
+def get_dataset_paths(images_dir='document_dataset_resized/train/images', masks_dir='document_dataset_resized/train/masks'):
     image_paths = sorted(glob.glob(os.path.join(images_dir, '*.jpg')))
     mask_paths = sorted(glob.glob(os.path.join(masks_dir, '*.png')))
     
