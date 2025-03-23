@@ -1,1 +1,0 @@
-('straightening', 0.5692452)
