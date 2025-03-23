@@ -12,20 +12,34 @@ from tensorflow.keras.utils import to_categorical
 from sklearn.model_selection import train_test_split
 import cv2
 
-# 避免内存溢出错误
-gpu_devices = tf.config.experimental.list_physical_devices('GPU')
-for device in gpu_devices:
-    tf.config.experimental.set_memory_growth(device, True)
+# GPU配置
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    try:
+        # 设置GPU内存增长
+        for device in physical_devices:
+            tf.config.experimental.set_memory_growth(device, True)
+        
+        # 设置GPU内存限制（根据你的GPU显存大小调整）
+        tf.config.set_logical_device_configuration(
+            physical_devices[0],
+            [tf.config.LogicalDeviceConfiguration(memory_limit=4096)]  # 限制为4GB，根据实际情况调整
+        )
+        print(f"GPU可用: {len(physical_devices)}个设备")
+        print(f"GPU设备名称: {physical_devices[0].name}")
+    except RuntimeError as e:
+        print(f"GPU配置错误: {e}")
+else:
+    print("未检测到GPU，将使用CPU运行")
+
+# 设置TensorFlow使用GPU
+tf.config.set_visible_devices(physical_devices, 'GPU')
 
 # 设置参数
 IMG_SIZE = 384
 BATCH_SIZE = 8
 EPOCHS = 50
 NUM_CLASSES = 2  # 背景和文档
-
-# 假设你的数据集结构：
-# - images/ 包含所有图像
-# - masks/ 包含所有掩码 (二值化: 0=背景, 1=文档)
 
 # 1. 数据准备
 def get_dataset_paths(images_dir='/content/document_dataset_resized/train/images', masks_dir='/content/document_dataset_resized/train/masks'):
