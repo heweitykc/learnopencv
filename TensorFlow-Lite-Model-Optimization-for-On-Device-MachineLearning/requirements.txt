@@ -1,4 +1,0 @@
-wheel
-numpy
-tensorflow==2.8.0
-jupyter
