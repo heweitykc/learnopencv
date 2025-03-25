@@ -12,29 +12,6 @@ from tensorflow.keras.utils import to_categorical
 from sklearn.model_selection import train_test_split
 import cv2
 
-# GPU配置
-physical_devices = tf.config.list_physical_devices('GPU')
-if physical_devices:
-    try:
-        # 设置GPU内存增长
-        for device in physical_devices:
-            tf.config.experimental.set_memory_growth(device, True)
-        
-        # 设置GPU内存限制（根据你的GPU显存大小调整）
-        tf.config.set_logical_device_configuration(
-            physical_devices[0],
-            [tf.config.LogicalDeviceConfiguration(memory_limit=4096)]  # 限制为4GB，根据实际情况调整
-        )
-        print(f"GPU可用: {len(physical_devices)}个设备")
-        print(f"GPU设备名称: {physical_devices[0].name}")
-    except RuntimeError as e:
-        print(f"GPU配置错误: {e}")
-else:
-    print("未检测到GPU，将使用CPU运行")
-
-# 设置TensorFlow使用GPU
-tf.config.set_visible_devices(physical_devices, 'GPU')
-
 # 设置参数
 IMG_SIZE = 384
 BATCH_SIZE = 8
@@ -42,7 +19,7 @@ EPOCHS = 50
 NUM_CLASSES = 2  # 背景和文档
 
 # 1. 数据准备
-def get_dataset_paths(images_dir='/content/document_dataset_resized/train/images', masks_dir='/content/document_dataset_resized/train/masks'):
+def get_dataset_paths(images_dir='/mnt/data/scan/document_dataset_resized/train/images', masks_dir='/mnt/data/scan/document_dataset_resized/train/masks'):
     image_paths = sorted(glob.glob(os.path.join(images_dir, '*.png')))
     mask_paths = sorted(glob.glob(os.path.join(masks_dir, '*.png')))
 
@@ -107,10 +84,26 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     base_model = MobileNetV3Large(
         input_shape=input_shape,
         include_top=False,
+        weights=None,  # 先不加载预训练权重
+        minimalistic=True
+    )
+    
+    # 加载预训练权重到基础模型
+    temp_model = MobileNetV3Large(
+        input_shape=(224, 224, 3),
+        include_top=False,
         weights='imagenet',
         minimalistic=True
     )
-
+    
+    # 复制可以共享的权重
+    for layer, temp_layer in zip(base_model.layers, temp_model.layers):
+        if layer.name == temp_layer.name:  # 确保层名称匹配
+            try:
+                layer.set_weights(temp_layer.get_weights())
+            except ValueError:
+                print(f"跳过层 {layer.name} 的权重加载")
+    
     # 冻结早期层
     for layer in base_model.layers[:100]:
         layer.trainable = False
@@ -118,8 +111,9 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     # 获取特征图
     input_image = base_model.input
 
-    # 低级特征 (浅层特征)
-    low_level_features = base_model.get_layer('expanded_conv_project').output
+    # 修改这里：使用 expanded_conv_3/project 作为低级特征
+    # 这个层位于网络的较早期，包含更多的空间细节信息
+    low_level_features = base_model.get_layer('expanded_conv_3/project').output
     low_level_features = tf.keras.layers.Conv2D(48, 1, padding='same',
                                               use_bias=False)(low_level_features)
     low_level_features = tf.keras.layers.BatchNormalization()(low_level_features)
@@ -159,13 +153,12 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     aspp_pool = tf.keras.layers.Activation('relu')(aspp_pool)
     aspp_pool = tf.keras.layers.UpSampling2D(size=(12, 12), interpolation='bilinear')(aspp_pool)
 
-    # 合并ASPP分支
+    # 合并ASPP分支，移除 dropout
     aspp_concat = tf.keras.layers.Concatenate()([aspp_conv1, aspp_conv2,
                                                 aspp_conv3, aspp_conv4, aspp_pool])
     aspp_concat = tf.keras.layers.Conv2D(256, 1, padding='same', use_bias=False)(aspp_concat)
     aspp_concat = tf.keras.layers.BatchNormalization()(aspp_concat)
     aspp_concat = tf.keras.layers.Activation('relu')(aspp_concat)
-    aspp_concat = tf.keras.layers.Dropout(0.5)(aspp_concat)
 
     # 上采样ASPP特征
     aspp_upsampled = tf.keras.layers.UpSampling2D(size=(4, 4),
@@ -192,11 +185,9 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     # 合并低级特征和ASPP特征
     decoder_concat = tf.keras.layers.Concatenate()([aspp_upsampled, low_level_features])
 
-    # 解码器
+    # 解码器，移除 dropout
     decoder = tf.keras.layers.Conv2D(256, 3, padding='same', activation='relu')(decoder_concat)
-    decoder = tf.keras.layers.Dropout(0.5)(decoder)
     decoder = tf.keras.layers.Conv2D(256, 3, padding='same', activation='relu')(decoder)
-    decoder = tf.keras.layers.Dropout(0.1)(decoder)
 
     # 计算最终上采样比例
     final_upsample_ratio = input_shape[0] // decoder.shape[1]
@@ -280,6 +271,12 @@ def iou_metric(y_true, y_pred, smooth=1e-6):
 
 # 4. 主函数：训练和转换模型
 def train_and_convert():
+    # 禁用布局优化器
+    tf.config.optimizer.set_experimental_options({
+        'layout_optimizer': False,
+        'scoped_allocator_optimization': False
+    })
+
     # 获取数据路径
     image_paths, mask_paths = get_dataset_paths()
 
