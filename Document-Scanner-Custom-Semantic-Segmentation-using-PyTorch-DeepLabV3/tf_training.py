@@ -103,8 +103,8 @@ def create_dataset(image_paths, mask_paths, training=True):
     # 启用更多优化选项
     options.experimental_optimization.map_parallelization = True
     options.experimental_optimization.parallel_batch = True
-    options.experimental_threading.private_threadpool_size = 24  # 增加线程池大小
-    options.experimental_threading.max_intra_op_parallelism = 12
+    options.threading.private_threadpool_size = 24  # 增加线程池大小
+    options.threading.max_intra_op_parallelism = 12
     dataset = dataset.with_options(options)
     
     # 增加并行处理数量
@@ -334,15 +334,15 @@ def train(train_dataset, val_dataset, steps_per_epoch):
         try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
-            # 限制GPU显存使用
-            tf.config.set_logical_device_configuration(
-                gpus[0],
-                [tf.config.LogicalDeviceConfiguration(memory_limit=20*1024)])  # 20GB
+            # 注释掉或减少内存限制
+            # tf.config.set_logical_device_configuration(
+            #     gpus[0],
+            #     [tf.config.LogicalDeviceConfiguration(memory_limit=20*1024)])  # 20GB
         except RuntimeError as e:
             print(e)
     
-    # 启用XLA优化和混合精度
-    tf.config.optimizer.set_jit(True)
+    # 禁用XLA优化，这可能是导致问题的原因
+    # tf.config.optimizer.set_jit(True)
     policy = tf.keras.mixed_precision.Policy('mixed_float16')
     tf.keras.mixed_precision.set_global_policy(policy)
     
@@ -350,6 +350,9 @@ def train(train_dataset, val_dataset, steps_per_epoch):
     gradient_accumulation_steps = 4
     effective_batch_size = BATCH_SIZE * gradient_accumulation_steps
     print(f"Effective batch size: {effective_batch_size}")
+    
+    # 计算验证步数
+    validation_steps = len(list(val_dataset)) # 或者直接设置一个固定值
     
     with tf.distribute.MirroredStrategy().scope():
         model = DeepLabV3Plus()
@@ -363,7 +366,7 @@ def train(train_dataset, val_dataset, steps_per_epoch):
             optimizer=optimizer,
             loss=combined_loss,
             metrics=[dice_coef, iou_metric],
-            steps_per_execution=gradient_accumulation_steps
+            steps_per_execution=1  # 修改为1，放弃梯度累积特性
         )
     
     # 优化数据加载
@@ -378,12 +381,12 @@ def train(train_dataset, val_dataset, steps_per_epoch):
     # 回调函数
     callbacks = [
         ModelCheckpoint(
-            'deeplabv3plus_mbv3_best.h5',
+            'deeplabv3plus_mbv3_best.h5',  # 改回使用.h5格式
             monitor='val_iou_metric',
             mode='max',
             save_best_only=True,
             verbose=1,
-            save_weights_only=True
+            save_weights_only=False
         ),
         ReduceLROnPlateau(
             monitor='val_loss',
@@ -410,12 +413,11 @@ def train(train_dataset, val_dataset, steps_per_epoch):
         epochs=EPOCHS,
         steps_per_epoch=steps_per_epoch // gradient_accumulation_steps,
         validation_data=val_dataset,
+        validation_steps=validation_steps,  # 添加这个参数
         callbacks=callbacks,
-        workers=16,  # 增加worker数量
+        workers=8,  # 减少worker数量
         use_multiprocessing=True,
-        max_queue_size=16,  # 增加队列大小
-        # 启用实验性能优化
-        experimental_run_tf_function=True
+        max_queue_size=8,  # 减少队列大小
     )
     
     return history
@@ -424,7 +426,7 @@ def convert():
     print("开始转换TFLite模型...")
     # 加载最佳模型
     model = tf.keras.models.load_model(
-        'deeplabv3plus_mbv3_best.h5',
+        'deeplabv3plus_mbv3_best.h5',  # 改回使用.h5格式
         custom_objects={
             'dice_coef': dice_coef,
             'dice_loss': dice_loss,
@@ -477,9 +479,7 @@ def convert():
     print(f"TFLite模型大小: {len(tflite_model) / (1024 * 1024):.2f} MB")
 
 def convert_test():
-    """
-    用于测试的TFLite转换函数，去掉量化步骤以加快转换速度
-    """
+    """用于测试的TFLite转换函数，改进转换精度"""
     print("1. 开始加载模型...")
     model = tf.keras.models.load_model(
         'deeplabv3plus_mbv3_best.h5',
@@ -491,25 +491,27 @@ def convert_test():
             'iou_metric': iou_metric
         }
     )
-
+    
     print("2. 创建推断模型...")
-    # 创建简单的推断模型
+    # 注意：不要重复添加sigmoid，原模型输出已经经过sigmoid处理
     input_tensor = tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
     outputs = model(input_tensor)
-    outputs = tf.keras.layers.Activation('sigmoid')(outputs)  # 添加sigmoid激活函数
+    # 移除这一行，避免重复sigmoid
+    # outputs = tf.keras.layers.Activation('sigmoid')(outputs)
     inference_model = tf.keras.Model(inputs=input_tensor, outputs=outputs)
-
+    
     print("3. 配置转换器...")
-    # 简单的TFLite转换配置
     converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
+    # 添加优化配置
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.target_spec.supported_ops = [
         tf.lite.OpsSet.TFLITE_BUILTINS,
         tf.lite.OpsSet.SELECT_TF_OPS
     ]
-
-    print("4. 开始转换(这可能需要几分钟)...")
+    
+    print("4. 开始转换...")
     tflite_model = converter.convert()
-
+    
     print("5. 保存模型...")
     with open('doc_scanner_mbv3_test.tflite', 'wb') as f:
         f.write(tflite_model)
@@ -519,7 +521,7 @@ def convert_test():
     
     return 'doc_scanner_mbv3_test.tflite'
 
-def test_tflite_model(tflite_model_path='doc_scanner_mbv3.tflite'):
+def test_tflite_model(tflite_model_path='doc_scanner_mbv3_test.tflite'):
     """测试TFLite模型的推理效果"""
     print("开始测试TFLite模型...")
     
@@ -541,20 +543,19 @@ def test_tflite_model(tflite_model_path='doc_scanner_mbv3.tflite'):
         test_mask = masks[0]
         break
 
-    # 预处理图像
+    # 预处理图像 - 修改这里：保持为FLOAT32类型
     input_shape = input_details[0]['shape']
-    test_image_uint8 = tf.cast(test_image * 255, tf.uint8).numpy()
+    test_image_float = test_image.numpy()  # 保持为float32类型
     
     # 设置输入张量
-    interpreter.set_tensor(input_details[0]['index'], tf.expand_dims(test_image_uint8, 0))
+    interpreter.set_tensor(input_details[0]['index'], tf.expand_dims(test_image_float, 0))
     
     # 运行推理
     print("\n执行推理...")
     interpreter.invoke()
     
-    # 获取输出
+    # 获取输出 - 输出也不需要从uint8转回float32
     output = interpreter.get_tensor(output_details[0]['index'])
-    output = output.astype(np.float32) / 255.0  # 从uint8转回float32
     
     # 显示结果
     plt.figure(figsize=(15, 5))
@@ -571,17 +572,29 @@ def test_tflite_model(tflite_model_path='doc_scanner_mbv3.tflite'):
     plt.title('ground truth mask')
     plt.axis('off')
     
-    # 显示预测结果
+    # 显示预测结果 - 修改这里：添加二值化以获得清晰轮廓
     plt.subplot(1, 3, 3)
+    pred_mask_binary = output[0,:,:,0] > 0.5  # 添加二值化
+    plt.imshow(pred_mask_binary, cmap='gray')
+    plt.title('TFLite prediction (binary)')
+    plt.axis('off')
+    
+    # 添加额外的子图，显示原始预测（未二值化）
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
     plt.imshow(output[0,:,:,0], cmap='gray')
-    plt.title('TFLite prediction')
+    plt.title('Raw prediction (probability)')
+    plt.axis('off')
+    
+    plt.subplot(1, 2, 2)
+    plt.imshow(pred_mask_binary, cmap='gray')
+    plt.title('Binary prediction (threshold=0.5)')
     plt.axis('off')
     
     plt.tight_layout()
-    plt.savefig('tflite_test_result.png')
-    plt.show()
+    plt.savefig('tflite_test_result_comparison.png')
     
-    print("\n测试完成! 结果已保存为 'tflite_test_result.png'")
+    print("\n测试完成! 结果已保存为 'tflite_test_result_comparison.png'")
     
     # 计算性能指标
     pred_mask = output[0,:,:,0] > 0.5
