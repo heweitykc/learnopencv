@@ -15,9 +15,9 @@ import cv2
 # 测试参数
 TRAIN_LEN = 0
 VAL_LEN = 0
-IMG_SIZE = 384
-BATCH_SIZE = 8
-EPOCHS = 5
+IMG_SIZE = 320
+BATCH_SIZE = 64
+EPOCHS = 50
 NUM_CLASSES = 2
 
 # 发布参数
@@ -27,7 +27,6 @@ NUM_CLASSES = 2
 # BATCH_SIZE = 8
 # EPOCHS = 50
 # NUM_CLASSES = 2  # 背景和文档
-
 
 train_dataset = None
 val_dataset = None
@@ -92,6 +91,7 @@ def create_dataset(image_paths, mask_paths, training=True):
     if training:
         dataset = dataset.map(data_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.shuffle(buffer_size=1000)
+        dataset = dataset.repeat()  # 添加数据重复
 
     dataset = dataset.batch(BATCH_SIZE)
     dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
@@ -290,23 +290,33 @@ def iou_metric(y_true, y_pred, smooth=1e-6):
     return (intersection + smooth) / (union + smooth)
 
 def train():
-    # 禁用布局优化器
-    tf.config.optimizer.set_experimental_options({
-        'layout_optimizer': False,
-        'scoped_allocator_optimization': False
-    })
+    # 配置多GPU策略
+    strategy = tf.distribute.MirroredStrategy()
+    print(f'Number of devices: {strategy.num_replicas_in_sync}')
+    
+    # 启用混合精度训练
+    policy = tf.keras.mixed_precision.Policy('mixed_float16')
+    tf.keras.mixed_precision.set_global_policy(policy)
+    
+    # 启用XLA加速
+    tf.config.optimizer.set_jit(True)
+    
+    with strategy.scope():
+        # 创建模型
+        model = DeepLabV3Plus()
+        
+        # 使用更激进的学习率
+        initial_learning_rate = 4e-4
+        optimizer = tf.keras.optimizers.Adam(learning_rate=initial_learning_rate)
+        
+        # 编译模型
+        model.compile(
+            optimizer=optimizer,
+            loss=combined_loss,
+            metrics=[dice_coef, iou_metric]
+        )
 
-    # 创建模型
-    model = DeepLabV3Plus()
-
-    # 编译模型
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-        loss=combined_loss,
-        metrics=[dice_coef, iou_metric]
-    )
-
-    # 回调函数
+    # 更激进的回调函数设置
     callbacks = [
         ModelCheckpoint(
             'deeplabv3plus_mbv3_best.h5',
@@ -317,14 +327,14 @@ def train():
         ),
         ReduceLROnPlateau(
             monitor='val_loss',
-            factor=0.5,
-            patience=5,
+            factor=0.6,
+            patience=2,  # 更快降低学习率
             min_lr=1e-6,
             verbose=1
         ),
         EarlyStopping(
             monitor='val_loss',
-            patience=15,
+            patience=6,  # 更早停止
             restore_best_weights=True,
             verbose=1
         )
@@ -425,6 +435,49 @@ def convert():
     print("TFLite模型已保存")
     print(f"TFLite模型大小: {len(tflite_model) / (1024 * 1024):.2f} MB")
 
+def convert_test():
+    """
+    用于测试的TFLite转换函数，去掉量化步骤以加快转换速度
+    """
+    print("1. 开始加载模型...")
+    model = tf.keras.models.load_model(
+        'deeplabv3plus_mbv3_best.h5',
+        custom_objects={
+            'dice_coef': dice_coef,
+            'dice_loss': dice_loss,
+            'binary_focal_loss': binary_focal_loss,
+            'combined_loss': combined_loss,
+            'iou_metric': iou_metric
+        }
+    )
+
+    print("2. 创建推断模型...")
+    # 创建简单的推断模型
+    input_tensor = tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+    outputs = model(input_tensor)
+    outputs = tf.keras.layers.Activation('sigmoid')(outputs)  # 添加sigmoid激活函数
+    inference_model = tf.keras.Model(inputs=input_tensor, outputs=outputs)
+
+    print("3. 配置转换器...")
+    # 简单的TFLite转换配置
+    converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS,
+        tf.lite.OpsSet.SELECT_TF_OPS
+    ]
+
+    print("4. 开始转换(这可能需要几分钟)...")
+    tflite_model = converter.convert()
+
+    print("5. 保存模型...")
+    with open('doc_scanner_mbv3_test.tflite', 'wb') as f:
+        f.write(tflite_model)
+    
+    print("转换完成!")
+    print(f"TFLite模型大小: {len(tflite_model) / (1024 * 1024):.2f} MB")
+    
+    return 'doc_scanner_mbv3_test.tflite'
+
 def test_tflite_model(tflite_model_path='doc_scanner_mbv3.tflite'):
     """测试TFLite模型的推理效果"""
     print("开始测试TFLite模型...")
@@ -513,7 +566,8 @@ if __name__ == "__main__":
     train()
     
     # 转换为TFLite
-    convert()
+    # convert()
+    convert_test()
     
     # 测试TFLite模型
     test_tflite_model()
