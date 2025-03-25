@@ -12,16 +12,31 @@ from tensorflow.keras.utils import to_categorical
 from sklearn.model_selection import train_test_split
 import cv2
 
-# 设置参数
+# 测试参数
+TRAIN_LEN = 100
+VAL_LEN = 20
 IMG_SIZE = 384
 BATCH_SIZE = 8
-EPOCHS = 50
-NUM_CLASSES = 2  # 背景和文档
+EPOCHS = 2
+NUM_CLASSES = 2
+
+# 发布参数
+# TRAIN_LEN = 100
+# VAL_LEN = 20
+# IMG_SIZE = 384
+# BATCH_SIZE = 8
+# EPOCHS = 50
+# NUM_CLASSES = 2  # 背景和文档
 
 # 1. 数据准备
 def get_dataset_paths(images_dir='/mnt/data/scan/document_dataset_resized/train/images', masks_dir='/mnt/data/scan/document_dataset_resized/train/masks'):
     image_paths = sorted(glob.glob(os.path.join(images_dir, '*.png')))
     mask_paths = sorted(glob.glob(os.path.join(masks_dir, '*.png')))
+
+    # 限制返回的数据集大小为指定的训练和验证长度
+    if len(image_paths) > TRAIN_LEN + VAL_LEN:
+        image_paths = image_paths[:TRAIN_LEN + VAL_LEN]
+        mask_paths = mask_paths[:TRAIN_LEN + VAL_LEN]
 
     print(len(image_paths))
     print(len(mask_paths))
