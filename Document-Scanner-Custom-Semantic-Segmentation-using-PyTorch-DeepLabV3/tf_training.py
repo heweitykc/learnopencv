@@ -23,7 +23,7 @@ NUM_CLASSES = 2
 
 # A10 * 1, 188GB内存优化参数
 IMG_SIZE = 384  # A10显存24GB，可以支持384分辨率
-BATCH_SIZE = 48  # A10显存充足，可以用较大batch
+BATCH_SIZE = 8  # 进一步降低batch size
 
 # 发布参数
 # TRAIN_LEN = 0
@@ -94,30 +94,42 @@ def parse_image(img_path, mask_path):
 def create_dataset(image_paths, mask_paths, training=True):
     AUTOTUNE = tf.data.AUTOTUNE
     
-    # 将路径转换为tf.data.Dataset格式
     dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
     
-    # 启用确定性操作以提高性能
+    # 优化数据加载选项
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
     options.deterministic = False
+    # 启用更多优化选项
+    options.experimental_optimization.map_parallelization = True
+    options.experimental_optimization.parallel_batch = True
+    options.experimental_threading.private_threadpool_size = 24  # 增加线程池大小
+    options.experimental_threading.max_intra_op_parallelism = 12
     dataset = dataset.with_options(options)
     
-    # 增加并行处理数量，利用32核CPU
-    dataset = dataset.map(parse_image, num_parallel_calls=16)
-
-    if training:
-        dataset = dataset.map(data_augmentation, num_parallel_calls=16)
-        # 使用较大的shuffle buffer
-        dataset = dataset.shuffle(buffer_size=4000, reshuffle_each_iteration=True)
-        dataset = dataset.repeat()
-        # 使用drop_remainder确保batch大小一致
-        dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)
-    else:
-        dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)
+    # 增加并行处理数量
+    dataset = dataset.map(parse_image, num_parallel_calls=AUTOTUNE)
     
-    # 预取数据
+    if training:
+        # 增加数据增强的并行处理
+        dataset = dataset.map(data_augmentation, num_parallel_calls=AUTOTUNE)
+        # 增加shuffle buffer大小
+        dataset = dataset.shuffle(buffer_size=8000, reshuffle_each_iteration=True)
+        dataset = dataset.repeat()
+    
+    # 使用interleave来并行加载数据
+    dataset = dataset.interleave(
+        lambda x, y: tf.data.Dataset.from_tensors((x, y)),
+        cycle_length=8,  # 并行加载的文件数
+        num_parallel_calls=AUTOTUNE,
+        deterministic=False
+    )
+    
+    # 批处理
+    dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)
+    # 预取多个批次
     dataset = dataset.prefetch(buffer_size=AUTOTUNE)
+    
     return dataset
 
 # 2. 创建DeepLabV3+模型
@@ -165,24 +177,24 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     x = base_model.output
 
     # 1x1卷积
-    aspp_conv1 = tf.keras.layers.Conv2D(256, 1, padding='same', use_bias=False)(x)
+    aspp_conv1 = tf.keras.layers.Conv2D(128, 1, padding='same', use_bias=False)(x)
     aspp_conv1 = tf.keras.layers.BatchNormalization()(aspp_conv1)
     aspp_conv1 = tf.keras.layers.Activation('relu')(aspp_conv1)
 
     # 空洞卷积率=6
-    aspp_conv2 = tf.keras.layers.Conv2D(256, 3, padding='same',
+    aspp_conv2 = tf.keras.layers.Conv2D(128, 3, padding='same',
                                       dilation_rate=6, use_bias=False)(x)
     aspp_conv2 = tf.keras.layers.BatchNormalization()(aspp_conv2)
     aspp_conv2 = tf.keras.layers.Activation('relu')(aspp_conv2)
 
     # 空洞卷积率=12
-    aspp_conv3 = tf.keras.layers.Conv2D(256, 3, padding='same',
+    aspp_conv3 = tf.keras.layers.Conv2D(128, 3, padding='same',
                                       dilation_rate=12, use_bias=False)(x)
     aspp_conv3 = tf.keras.layers.BatchNormalization()(aspp_conv3)
     aspp_conv3 = tf.keras.layers.Activation('relu')(aspp_conv3)
 
     # 空洞卷积率=18
-    aspp_conv4 = tf.keras.layers.Conv2D(256, 3, padding='same',
+    aspp_conv4 = tf.keras.layers.Conv2D(128, 3, padding='same',
                                       dilation_rate=18, use_bias=False)(x)
     aspp_conv4 = tf.keras.layers.BatchNormalization()(aspp_conv4)
     aspp_conv4 = tf.keras.layers.Activation('relu')(aspp_conv4)
@@ -190,7 +202,7 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     # 全局平均池化
     aspp_pool = tf.keras.layers.GlobalAveragePooling2D()(x)
     aspp_pool = tf.keras.layers.Reshape((1, 1, -1))(aspp_pool)
-    aspp_pool = tf.keras.layers.Conv2D(256, 1, padding='same', use_bias=False)(aspp_pool)
+    aspp_pool = tf.keras.layers.Conv2D(128, 1, padding='same', use_bias=False)(aspp_pool)
     aspp_pool = tf.keras.layers.BatchNormalization()(aspp_pool)
     aspp_pool = tf.keras.layers.Activation('relu')(aspp_pool)
     aspp_pool = tf.keras.layers.UpSampling2D(size=(12, 12), interpolation='bilinear')(aspp_pool)
@@ -198,7 +210,7 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     # 合并ASPP分支，移除 dropout
     aspp_concat = tf.keras.layers.Concatenate()([aspp_conv1, aspp_conv2,
                                                 aspp_conv3, aspp_conv4, aspp_pool])
-    aspp_concat = tf.keras.layers.Conv2D(256, 1, padding='same', use_bias=False)(aspp_concat)
+    aspp_concat = tf.keras.layers.Conv2D(128, 1, padding='same', use_bias=False)(aspp_concat)
     aspp_concat = tf.keras.layers.BatchNormalization()(aspp_concat)
     aspp_concat = tf.keras.layers.Activation('relu')(aspp_concat)
 
@@ -228,8 +240,8 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     decoder_concat = tf.keras.layers.Concatenate()([aspp_upsampled, low_level_features])
 
     # 解码器，移除 dropout
-    decoder = tf.keras.layers.Conv2D(256, 3, padding='same', activation='relu')(decoder_concat)
-    decoder = tf.keras.layers.Conv2D(256, 3, padding='same', activation='relu')(decoder)
+    decoder = tf.keras.layers.Conv2D(128, 3, padding='same', activation='relu')(decoder_concat)
+    decoder = tf.keras.layers.Conv2D(128, 3, padding='same', activation='relu')(decoder)
 
     # 计算最终上采样比例
     final_upsample_ratio = input_shape[0] // decoder.shape[1]
@@ -311,90 +323,102 @@ def iou_metric(y_true, y_pred, smooth=1e-6):
     union = tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) - intersection
     return (intersection + smooth) / (union + smooth)
 
-def train():
-    strategy = tf.distribute.MirroredStrategy()
-    print(f'Number of devices: {strategy.num_replicas_in_sync}')
+def train(train_dataset, val_dataset, steps_per_epoch):
+    # 设置环境变量以使用备选卷积算法
+    import os
+    os.environ['XLA_FLAGS'] = '--xla_gpu_strict_conv_algorithm_picker=false'
     
-    with strategy.scope():
+    # 配置GPU内存
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            # 限制GPU显存使用
+            tf.config.set_logical_device_configuration(
+                gpus[0],
+                [tf.config.LogicalDeviceConfiguration(memory_limit=20*1024)])  # 20GB
+        except RuntimeError as e:
+            print(e)
+    
+    # 启用XLA优化和混合精度
+    tf.config.optimizer.set_jit(True)
+    policy = tf.keras.mixed_precision.Policy('mixed_float16')
+    tf.keras.mixed_precision.set_global_policy(policy)
+    
+    # 使用梯度累积来模拟更大的批量大小
+    gradient_accumulation_steps = 4
+    effective_batch_size = BATCH_SIZE * gradient_accumulation_steps
+    print(f"Effective batch size: {effective_batch_size}")
+    
+    with tf.distribute.MirroredStrategy().scope():
         model = DeepLabV3Plus()
         
-        initial_learning_rate = 3e-4  # 适当提高学习率
+        # 优化器配置
+        initial_learning_rate = 1e-4  # 降低学习率
         optimizer = tf.keras.optimizers.Adam(learning_rate=initial_learning_rate)
-        
-        # 启用混合精度训练以提高性能
-        policy = tf.keras.mixed_precision.Policy('mixed_float16')
-        tf.keras.mixed_precision.set_global_policy(policy)
+        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
         
         model.compile(
             optimizer=optimizer,
             loss=combined_loss,
             metrics=[dice_coef, iou_metric],
-            experimental_steps_per_execution=2  # 使用较小的梯度累积步数
+            steps_per_execution=gradient_accumulation_steps
         )
-
-    # 更激进的回调函数设置
+    
+    # 优化数据加载
+    options = tf.data.Options()
+    options.experimental_optimization.map_parallelization = True
+    options.experimental_optimization.parallel_batch = True
+    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+    
+    train_dataset = train_dataset.with_options(options).prefetch(tf.data.AUTOTUNE)
+    val_dataset = val_dataset.with_options(options).prefetch(tf.data.AUTOTUNE)
+    
+    # 回调函数
     callbacks = [
         ModelCheckpoint(
             'deeplabv3plus_mbv3_best.h5',
             monitor='val_iou_metric',
             mode='max',
             save_best_only=True,
-            verbose=1
+            verbose=1,
+            save_weights_only=True
         ),
         ReduceLROnPlateau(
             monitor='val_loss',
-            factor=0.6,
-            patience=2,  # 更快降低学习率
+            factor=0.5,
+            patience=5,
             min_lr=1e-6,
             verbose=1
         ),
         EarlyStopping(
             monitor='val_loss',
-            patience=6,  # 更早停止
+            patience=10,
             restore_best_weights=True,
             verbose=1
+        ),
+        tf.keras.callbacks.TensorBoard(
+            log_dir='./logs',
+            update_freq=200
         )
     ]
-
-    # 训练模型
+    
+    # 训练配置
     history = model.fit(
         train_dataset,
         epochs=EPOCHS,
-        steps_per_epoch=steps_per_epoch,  # 指定训练步数
-        validation_data=val_dataset,      # 验证集是有限的，不需要指定steps
-        callbacks=callbacks
+        steps_per_epoch=steps_per_epoch // gradient_accumulation_steps,
+        validation_data=val_dataset,
+        callbacks=callbacks,
+        workers=16,  # 增加worker数量
+        use_multiprocessing=True,
+        max_queue_size=16,  # 增加队列大小
+        # 启用实验性能优化
+        experimental_run_tf_function=True
     )
-
-    # 绘制训练历史
-    plt.figure(figsize=(15, 5))
-
-    plt.subplot(1, 3, 1)
-    plt.plot(history.history['loss'], label='Train Loss')
-    plt.plot(history.history['val_loss'], label='Val Loss')
-    plt.legend()
-    plt.title('Loss')
-
-    plt.subplot(1, 3, 2)
-    plt.plot(history.history['dice_coef'], label='Train Dice')
-    plt.plot(history.history['val_dice_coef'], label='Val Dice')
-    plt.legend()
-    plt.title('Dice Coefficient')
-
-    plt.subplot(1, 3, 3)
-    plt.plot(history.history['iou_metric'], label='Train IoU')
-    plt.plot(history.history['val_iou_metric'], label='Val IoU')
-    plt.legend()
-    plt.title('IoU')
-
-    plt.tight_layout()
-    plt.savefig('training_history.png')
-    plt.show()
-
-    # 保存模型
-    model.save('deeplabv3plus_mbv3_final.h5')
-    print("模型训练完成并保存")
     
-    return train_dataset  # 返回训练数据集供convert函数使用
+    return history
 
 def convert():
     print("开始转换TFLite模型...")
@@ -583,18 +607,34 @@ if __name__ == "__main__":
     print(f"验证集大小: {len(val_img_paths)}")
     print(f"每轮训练步数: {steps_per_epoch}")
     
-    # 创建数据集时指定sharding
+    # 设置TensorFlow性能优化选项
+    tf.config.threading.set_inter_op_parallelism_threads(8)
+    tf.config.threading.set_intra_op_parallelism_threads(16)
+    
+    # 启用内存增长
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            print(e)
+    
+    # 优化数据加载选项
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+    options.experimental_optimization.map_parallelization = True
+    options.experimental_optimization.parallel_batch = True
     
+    # 创建数据集
     train_dataset = create_dataset(train_img_paths, train_mask_paths, training=True)
     train_dataset = train_dataset.with_options(options)
     
     val_dataset = create_dataset(val_img_paths, val_mask_paths, training=False)
     val_dataset = val_dataset.with_options(options)
     
-    # 训练模型
-    train()
+    # 将数据集作为参数传递给train函数
+    history = train(train_dataset, val_dataset, steps_per_epoch)
     
     # 转换为TFLite
     # convert()
