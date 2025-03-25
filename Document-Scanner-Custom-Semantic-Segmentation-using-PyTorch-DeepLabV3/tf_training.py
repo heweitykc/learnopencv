@@ -28,6 +28,9 @@ NUM_CLASSES = 2
 # EPOCHS = 50
 # NUM_CLASSES = 2  # 背景和文档
 
+
+train_dataset = None
+val_dataset = None
 # 1. 数据准备
 def get_dataset_paths(images_dir='/mnt/data/scan/document_dataset_resized/train/images', masks_dir='/mnt/data/scan/document_dataset_resized/train/masks'):
     image_paths = sorted(glob.glob(os.path.join(images_dir, '*.png')))
@@ -284,27 +287,12 @@ def iou_metric(y_true, y_pred, smooth=1e-6):
     union = tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) - intersection
     return (intersection + smooth) / (union + smooth)
 
-# 4. 主函数：训练和转换模型
-def train_and_convert():
+def train():
     # 禁用布局优化器
     tf.config.optimizer.set_experimental_options({
         'layout_optimizer': False,
         'scoped_allocator_optimization': False
     })
-
-    # 获取数据路径
-    image_paths, mask_paths = get_dataset_paths()
-
-    # 分割训练和验证集
-    train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = train_test_split(
-        image_paths, mask_paths, test_size=0.2, random_state=42)
-
-    print(f"训练图像数量: {len(train_img_paths)}")
-    print(f"验证图像数量: {len(val_img_paths)}")
-
-    # 创建数据集
-    train_dataset = create_dataset(train_img_paths, train_mask_paths, training=True)
-    val_dataset = create_dataset(val_img_paths, val_mask_paths, training=False)
 
     # 创建模型
     model = DeepLabV3Plus()
@@ -376,8 +364,10 @@ def train_and_convert():
     # 保存模型
     model.save('deeplabv3plus_mbv3_final.h5')
     print("模型训练完成并保存")
+    
+    return train_dataset  # 返回训练数据集供convert函数使用
 
-    # 转换为TensorFlow Lite
+def convert():
     # 加载最佳模型
     model = tf.keras.models.load_model(
         'deeplabv3plus_mbv3_best.h5',
@@ -397,7 +387,7 @@ def train_and_convert():
     def post_processing(x):
         return tf.sigmoid(x)
 
-    # 创建一个推断模型，包含sigmoid激活函数
+    # 创建推断模型
     input_tensor = tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
     preprocessed = tf.keras.layers.Lambda(preprocess_input)(input_tensor)
     features = model(preprocessed)
@@ -406,11 +396,9 @@ def train_and_convert():
 
     # TFLite转换
     converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
-
-    # 优化设置
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
 
-    # 用于量化校准的代表性数据集
+    # 量化校准数据集
     def representative_dataset():
         for image_batch, _ in train_dataset.take(100):
             for image in image_batch:
@@ -423,67 +411,32 @@ def train_and_convert():
     converter.inference_input_type = tf.uint8
     converter.inference_output_type = tf.uint8
 
-    # 转换模型
+    # 转换并保存模型
     tflite_model = converter.convert()
-
-    # 保存TFLite模型
     with open('doc_scanner_mbv3.tflite', 'wb') as f:
         f.write(tflite_model)
     print("TFLite模型已保存")
-
-    # 打印模型大小
     print(f"TFLite模型大小: {len(tflite_model) / (1024 * 1024):.2f} MB")
 
-    # 测试TFLite模型
-    # 加载TFLite模型
-    interpreter = tf.lite.Interpreter(model_content=tflite_model)
-    interpreter.allocate_tensors()
+    return tflite_model
 
-    # 获取输入输出细节
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
 
-    print("TFLite模型输入详情:", input_details)
-    print("TFLite模型输出详情:", output_details)
 
-    # 测试一个样本
-    sample_image, sample_mask = next(iter(val_dataset))[0][0], next(iter(val_dataset))[1][0]
+# 获取数据路径
+image_paths, mask_paths = get_dataset_paths()
 
-    # 转换为uint8格式
-    sample_image_uint8 = tf.cast(sample_image * 255, tf.uint8).numpy()
+# 分割训练和验证集
+train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = train_test_split(
+    image_paths, mask_paths, test_size=0.2, random_state=42)
 
-    # 设置输入
-    interpreter.set_tensor(input_details[0]['index'], tf.expand_dims(sample_image_uint8, 0))
+print(f"训练图像数量: {len(train_img_paths)}")
+print(f"验证图像数量: {len(val_img_paths)}")
 
-    # 推理
-    interpreter.invoke()
+# 创建数据集
+train_dataset = create_dataset(train_img_paths, train_mask_paths, training=True)
+val_dataset = create_dataset(val_img_paths, val_mask_paths, training=False)
 
-    # 获取输出
-    output = interpreter.get_tensor(output_details[0]['index'])
-    output = output.astype(np.float32) / 255.0  # 从uint8转回float32
 
-    # 显示结果
-    plt.figure(figsize=(12, 4))
+train()
 
-    plt.subplot(1, 3, 1)
-    plt.imshow(sample_image)
-    plt.title('原始图像')
-    plt.axis('off')
-
-    plt.subplot(1, 3, 2)
-    plt.imshow(sample_mask[:,:,0], cmap='gray')
-    plt.title('真实掩码')
-    plt.axis('off')
-
-    plt.subplot(1, 3, 3)
-    plt.imshow(output[0,:,:,0], cmap='gray')
-    plt.title('TFLite预测')
-    plt.axis('off')
-
-    plt.tight_layout()
-    plt.savefig('tflite_test_result.png')
-    plt.show()
-
-# 运行主函数
-if __name__ == "__main__":
-    train_and_convert()
+convert()
