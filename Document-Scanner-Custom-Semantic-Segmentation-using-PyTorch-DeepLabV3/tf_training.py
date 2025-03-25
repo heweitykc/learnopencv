@@ -93,18 +93,30 @@ def parse_image(img_path, mask_path):
 # 创建TensorFlow数据集
 def create_dataset(image_paths, mask_paths, training=True):
     AUTOTUNE = tf.data.AUTOTUNE
+    
+    # 将路径转换为tf.data.Dataset格式
     dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
+    
+    # 启用确定性操作以提高性能
+    options = tf.data.Options()
+    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+    options.deterministic = False
+    dataset = dataset.with_options(options)
+    
     # 增加并行处理数量，利用32核CPU
-    dataset = dataset.map(parse_image, num_parallel_calls=16)  
+    dataset = dataset.map(parse_image, num_parallel_calls=16)
 
     if training:
         dataset = dataset.map(data_augmentation, num_parallel_calls=16)
-        dataset = dataset.shuffle(buffer_size=4000)  # 增大shuffle buffer利用大内存
+        # 使用较大的shuffle buffer
+        dataset = dataset.shuffle(buffer_size=4000, reshuffle_each_iteration=True)
         dataset = dataset.repeat()
-        dataset = dataset.batch(BATCH_SIZE)
+        # 使用drop_remainder确保batch大小一致
+        dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)
     else:
-        dataset = dataset.batch(BATCH_SIZE)
-        
+        dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)
+    
+    # 预取数据
     dataset = dataset.prefetch(buffer_size=AUTOTUNE)
     return dataset
 
@@ -563,17 +575,23 @@ if __name__ == "__main__":
     train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = train_test_split(
         image_paths, mask_paths, test_size=0.2, random_state=42)
     
-    # 计算步数
-    steps_per_epoch = len(train_img_paths)
+    # 计算steps_per_epoch
+    steps_per_epoch = len(train_img_paths) // BATCH_SIZE
     steps_per_epoch = max(1, steps_per_epoch)
     
     print(f"训练集大小: {len(train_img_paths)}")
     print(f"验证集大小: {len(val_img_paths)}")
     print(f"每轮训练步数: {steps_per_epoch}")
     
-    # 创建数据集
+    # 创建数据集时指定sharding
+    options = tf.data.Options()
+    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+    
     train_dataset = create_dataset(train_img_paths, train_mask_paths, training=True)
+    train_dataset = train_dataset.with_options(options)
+    
     val_dataset = create_dataset(val_img_paths, val_mask_paths, training=False)
+    val_dataset = val_dataset.with_options(options)
     
     # 训练模型
     train()
