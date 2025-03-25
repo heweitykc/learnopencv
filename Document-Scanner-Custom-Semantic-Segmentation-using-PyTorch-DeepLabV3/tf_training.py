@@ -21,9 +21,9 @@ NUM_CLASSES = 2
 # IMG_SIZE = 320
 # BATCH_SIZE = 64
 
-# A10 * 1, 188内存
-IMG_SIZE = 320  # 从384降到320
-BATCH_SIZE = 32  # 从128降到32
+# A10 * 1, 188GB内存优化参数
+IMG_SIZE = 384  # A10显存24GB，可以支持384分辨率
+BATCH_SIZE = 48  # A10显存充足，可以用较大batch
 
 # 发布参数
 # TRAIN_LEN = 0
@@ -94,15 +94,16 @@ def parse_image(img_path, mask_path):
 def create_dataset(image_paths, mask_paths, training=True):
     AUTOTUNE = tf.data.AUTOTUNE
     dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
-    dataset = dataset.map(parse_image, num_parallel_calls=AUTOTUNE)
+    # 增加并行处理数量，利用32核CPU
+    dataset = dataset.map(parse_image, num_parallel_calls=16)  
 
     if training:
-        dataset = dataset.map(data_augmentation, num_parallel_calls=AUTOTUNE)
-        dataset = dataset.shuffle(buffer_size=2000)  # 增大shuffle buffer
-        dataset = dataset.repeat()  # 只对训练集重复
+        dataset = dataset.map(data_augmentation, num_parallel_calls=16)
+        dataset = dataset.shuffle(buffer_size=4000)  # 增大shuffle buffer利用大内存
+        dataset = dataset.repeat()
         dataset = dataset.batch(BATCH_SIZE)
     else:
-        dataset = dataset.batch(BATCH_SIZE)  # 验证集不重复
+        dataset = dataset.batch(BATCH_SIZE)
         
     dataset = dataset.prefetch(buffer_size=AUTOTUNE)
     return dataset
@@ -305,16 +306,18 @@ def train():
     with strategy.scope():
         model = DeepLabV3Plus()
         
-        # 使用更小的初始学习率
-        initial_learning_rate = 2e-4
+        initial_learning_rate = 3e-4  # 适当提高学习率
         optimizer = tf.keras.optimizers.Adam(learning_rate=initial_learning_rate)
         
-        # 启用混合精度训练
+        # 启用混合精度训练以提高性能
+        policy = tf.keras.mixed_precision.Policy('mixed_float16')
+        tf.keras.mixed_precision.set_global_policy(policy)
+        
         model.compile(
             optimizer=optimizer,
             loss=combined_loss,
             metrics=[dice_coef, iou_metric],
-            experimental_steps_per_execution=4  # 梯度累积步数
+            experimental_steps_per_execution=2  # 使用较小的梯度累积步数
         )
 
     # 更激进的回调函数设置
