@@ -12,13 +12,18 @@ from tensorflow.keras.utils import to_categorical
 from sklearn.model_selection import train_test_split
 import cv2
 
-# 测试参数
 TRAIN_LEN = 0
 VAL_LEN = 0
-IMG_SIZE = 320
-BATCH_SIZE = 64
 EPOCHS = 50
 NUM_CLASSES = 2
+
+# p100*2, ecs.gn5-c8g1.4xlarge
+# IMG_SIZE = 320
+# BATCH_SIZE = 64
+
+# A10 * 1, 188内存
+IMG_SIZE = 320  # 从384降到320
+BATCH_SIZE = 32  # 从128降到32
 
 # 发布参数
 # TRAIN_LEN = 0
@@ -27,6 +32,8 @@ NUM_CLASSES = 2
 # BATCH_SIZE = 8
 # EPOCHS = 50
 # NUM_CLASSES = 2  # 背景和文档
+
+
 
 train_dataset = None
 val_dataset = None
@@ -85,17 +92,19 @@ def parse_image(img_path, mask_path):
 
 # 创建TensorFlow数据集
 def create_dataset(image_paths, mask_paths, training=True):
+    AUTOTUNE = tf.data.AUTOTUNE
     dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
-    dataset = dataset.map(parse_image, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.map(parse_image, num_parallel_calls=AUTOTUNE)
 
     if training:
-        dataset = dataset.map(data_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.shuffle(buffer_size=1000)
-        dataset = dataset.repeat()  # 添加数据重复
-
-    dataset = dataset.batch(BATCH_SIZE)
-    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-
+        dataset = dataset.map(data_augmentation, num_parallel_calls=AUTOTUNE)
+        dataset = dataset.shuffle(buffer_size=2000)  # 增大shuffle buffer
+        dataset = dataset.repeat()  # 只对训练集重复
+        dataset = dataset.batch(BATCH_SIZE)
+    else:
+        dataset = dataset.batch(BATCH_SIZE)  # 验证集不重复
+        
+    dataset = dataset.prefetch(buffer_size=AUTOTUNE)
     return dataset
 
 # 2. 创建DeepLabV3+模型
@@ -290,30 +299,22 @@ def iou_metric(y_true, y_pred, smooth=1e-6):
     return (intersection + smooth) / (union + smooth)
 
 def train():
-    # 配置多GPU策略
     strategy = tf.distribute.MirroredStrategy()
     print(f'Number of devices: {strategy.num_replicas_in_sync}')
     
-    # 启用混合精度训练
-    policy = tf.keras.mixed_precision.Policy('mixed_float16')
-    tf.keras.mixed_precision.set_global_policy(policy)
-    
-    # 启用XLA加速
-    tf.config.optimizer.set_jit(True)
-    
     with strategy.scope():
-        # 创建模型
         model = DeepLabV3Plus()
         
-        # 使用更激进的学习率
-        initial_learning_rate = 4e-4
+        # 使用更小的初始学习率
+        initial_learning_rate = 2e-4
         optimizer = tf.keras.optimizers.Adam(learning_rate=initial_learning_rate)
         
-        # 编译模型
+        # 启用混合精度训练
         model.compile(
             optimizer=optimizer,
             loss=combined_loss,
-            metrics=[dice_coef, iou_metric]
+            metrics=[dice_coef, iou_metric],
+            experimental_steps_per_execution=4  # 梯度累积步数
         )
 
     # 更激进的回调函数设置
@@ -344,7 +345,8 @@ def train():
     history = model.fit(
         train_dataset,
         epochs=EPOCHS,
-        validation_data=val_dataset,
+        steps_per_epoch=steps_per_epoch,  # 指定训练步数
+        validation_data=val_dataset,      # 验证集是有限的，不需要指定steps
         callbacks=callbacks
     )
 
@@ -557,6 +559,14 @@ if __name__ == "__main__":
     # 分割训练和验证集
     train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = train_test_split(
         image_paths, mask_paths, test_size=0.2, random_state=42)
+    
+    # 计算步数
+    steps_per_epoch = len(train_img_paths)
+    steps_per_epoch = max(1, steps_per_epoch)
+    
+    print(f"训练集大小: {len(train_img_paths)}")
+    print(f"验证集大小: {len(val_img_paths)}")
+    print(f"每轮训练步数: {steps_per_epoch}")
     
     # 创建数据集
     train_dataset = create_dataset(train_img_paths, train_mask_paths, training=True)
