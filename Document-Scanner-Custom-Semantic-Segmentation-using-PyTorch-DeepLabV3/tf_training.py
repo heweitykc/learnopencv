@@ -17,13 +17,9 @@ VAL_LEN = 0
 EPOCHS = 50
 NUM_CLASSES = 2
 
-# p100*2, ecs.gn5-c8g1.4xlarge
-# IMG_SIZE = 320
-# BATCH_SIZE = 64
-
-# A10 * 1, 188GB内存优化参数
-IMG_SIZE = 384  # A10显存24GB，可以支持384分辨率
-BATCH_SIZE = 48  # A10显存充足，可以用较大batch
+# 双T4 * 2, 32GB总显存, 48核CPU, 186GB内存优化参数
+IMG_SIZE = 384  # T4显存充足，可以支持更高分辨率
+BATCH_SIZE = 32  # 每个T4分配16张图像，总计32
 
 # 发布参数
 # TRAIN_LEN = 0
@@ -57,6 +53,7 @@ def get_dataset_paths(images_dir='/mnt/data/scan/document_dataset_resized/train/
     return image_paths, mask_paths
 
 # 数据增强
+@tf.function
 def data_augmentation(image, mask):
     # 50%几率应用增强
     if tf.random.uniform(()) > 0.5:
@@ -75,6 +72,7 @@ def data_augmentation(image, mask):
     return image, mask
 
 # 解析图像和掩码
+@tf.function
 def parse_image(img_path, mask_path):
     # 读取图像
     image = tf.io.read_file(img_path)
@@ -97,26 +95,29 @@ def create_dataset(image_paths, mask_paths, training=True):
     # 将路径转换为tf.data.Dataset格式
     dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
     
+    # 添加缓存以减少I/O瓶颈
+    dataset = dataset.cache()
+    
     # 启用确定性操作以提高性能
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
     options.deterministic = False
+    options.experimental_optimization.map_parallelization = True  # 启用并行映射优化
     dataset = dataset.with_options(options)
     
-    # 增加并行处理数量，利用32核CPU
-    dataset = dataset.map(parse_image, num_parallel_calls=16)
+    # 充分利用48核CPU，增加并行处理数量
+    dataset = dataset.map(parse_image, num_parallel_calls=24)  # 使用一半的CPU核心
 
     if training:
-        dataset = dataset.map(data_augmentation, num_parallel_calls=16)
-        # 使用较大的shuffle buffer
-        dataset = dataset.shuffle(buffer_size=4000, reshuffle_each_iteration=True)
+        dataset = dataset.map(data_augmentation, num_parallel_calls=24)
+        # 利用186GB大内存，增大shuffle buffer
+        dataset = dataset.shuffle(buffer_size=5000, reshuffle_each_iteration=True)
         dataset = dataset.repeat()
-        # 使用drop_remainder确保batch大小一致
         dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)
     else:
         dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)
     
-    # 预取数据
+    # 增大预取缓冲区
     dataset = dataset.prefetch(buffer_size=AUTOTUNE)
     return dataset
 
@@ -153,9 +154,8 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     # 获取特征图
     input_image = base_model.input
 
-    # 修改这里：使用 expanded_conv_3/project 作为低级特征
-    # 这个层位于网络的较早期，包含更多的空间细节信息
-    low_level_features = base_model.get_layer('expanded_conv_3/project').output
+    # 修改这里：使用正确的层名称 (expanded_conv_3_project 而不是 expanded_conv_3/project)
+    low_level_features = base_model.get_layer('expanded_conv_3_project').output
     low_level_features = tf.keras.layers.Conv2D(48, 1, padding='same',
                                               use_bias=False)(low_level_features)
     low_level_features = tf.keras.layers.BatchNormalization()(low_level_features)
@@ -164,44 +164,41 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     # ASPP (Atrous Spatial Pyramid Pooling)
     x = base_model.output
 
+    # 获取特征图尺寸 - 注意这里只获取一次确保一致性
+    x_shape = tf.keras.backend.int_shape(x)
+    
     # 1x1卷积
-    aspp_conv1 = tf.keras.layers.Conv2D(256, 1, padding='same', use_bias=False)(x)
+    aspp_conv1 = tf.keras.layers.Conv2D(192, 1, padding='same', use_bias=False)(x)
     aspp_conv1 = tf.keras.layers.BatchNormalization()(aspp_conv1)
     aspp_conv1 = tf.keras.layers.Activation('relu')(aspp_conv1)
 
     # 空洞卷积率=6
-    aspp_conv2 = tf.keras.layers.Conv2D(256, 3, padding='same',
-                                      dilation_rate=6, use_bias=False)(x)
+    aspp_conv2 = tf.keras.layers.Conv2D(192, 3, padding='same', dilation_rate=6, use_bias=False)(x)
     aspp_conv2 = tf.keras.layers.BatchNormalization()(aspp_conv2)
     aspp_conv2 = tf.keras.layers.Activation('relu')(aspp_conv2)
 
     # 空洞卷积率=12
-    aspp_conv3 = tf.keras.layers.Conv2D(256, 3, padding='same',
-                                      dilation_rate=12, use_bias=False)(x)
+    aspp_conv3 = tf.keras.layers.Conv2D(192, 3, padding='same', dilation_rate=12, use_bias=False)(x)
     aspp_conv3 = tf.keras.layers.BatchNormalization()(aspp_conv3)
     aspp_conv3 = tf.keras.layers.Activation('relu')(aspp_conv3)
 
-    # 空洞卷积率=18
-    aspp_conv4 = tf.keras.layers.Conv2D(256, 3, padding='same',
-                                      dilation_rate=18, use_bias=False)(x)
-    aspp_conv4 = tf.keras.layers.BatchNormalization()(aspp_conv4)
-    aspp_conv4 = tf.keras.layers.Activation('relu')(aspp_conv4)
-
-    # 全局平均池化
+    # 全局平均池化 - 修改上采样方式
     aspp_pool = tf.keras.layers.GlobalAveragePooling2D()(x)
     aspp_pool = tf.keras.layers.Reshape((1, 1, -1))(aspp_pool)
-    aspp_pool = tf.keras.layers.Conv2D(256, 1, padding='same', use_bias=False)(aspp_pool)
+    aspp_pool = tf.keras.layers.Conv2D(192, 1, padding='same', use_bias=False)(aspp_pool)  # 修改为192保持一致
     aspp_pool = tf.keras.layers.BatchNormalization()(aspp_pool)
     aspp_pool = tf.keras.layers.Activation('relu')(aspp_pool)
-    aspp_pool = tf.keras.layers.UpSampling2D(size=(12, 12), interpolation='bilinear')(aspp_pool)
+    
+    # 根据x的实际尺寸动态上采样
+    aspp_pool = tf.keras.layers.UpSampling2D(
+        size=(x_shape[1], x_shape[2]),  # 直接使用x的高度和宽度
+        interpolation='bilinear'
+    )(aspp_pool)
 
-    # 合并ASPP分支，移除 dropout
-    aspp_concat = tf.keras.layers.Concatenate()([aspp_conv1, aspp_conv2,
-                                                aspp_conv3, aspp_conv4, aspp_pool])
-    aspp_concat = tf.keras.layers.Conv2D(256, 1, padding='same', use_bias=False)(aspp_concat)
-    aspp_concat = tf.keras.layers.BatchNormalization()(aspp_concat)
-    aspp_concat = tf.keras.layers.Activation('relu')(aspp_concat)
-
+    # 合并ASPP分支
+    aspp_concat = tf.keras.layers.Concatenate()([aspp_conv1, aspp_conv2, aspp_conv3, aspp_pool])
+    aspp_concat = tf.keras.layers.Conv2D(192, 1, padding='same', use_bias=False)(aspp_concat)  # 从256减少到192通道
+    
     # 上采样ASPP特征
     aspp_upsampled = tf.keras.layers.UpSampling2D(size=(4, 4),
                                                 interpolation='bilinear')(aspp_concat)
@@ -228,8 +225,8 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     decoder_concat = tf.keras.layers.Concatenate()([aspp_upsampled, low_level_features])
 
     # 解码器，移除 dropout
-    decoder = tf.keras.layers.Conv2D(256, 3, padding='same', activation='relu')(decoder_concat)
-    decoder = tf.keras.layers.Conv2D(256, 3, padding='same', activation='relu')(decoder)
+    decoder = tf.keras.layers.Conv2D(192, 3, padding='same', activation='relu')(decoder_concat)  # 从256减少到192通道
+    decoder = tf.keras.layers.Conv2D(192, 3, padding='same', activation='relu')(decoder)  # 从256减少到192通道
 
     # 计算最终上采样比例
     final_upsample_ratio = input_shape[0] // decoder.shape[1]
@@ -312,30 +309,47 @@ def iou_metric(y_true, y_pred, smooth=1e-6):
     return (intersection + smooth) / (union + smooth)
 
 def train():
+    # 启用XLA加速，可提升30%左右性能
+    tf.config.optimizer.set_jit(True)
+    
+    # 检查并设置GPU内存增长
+    physical_devices = tf.config.list_physical_devices('GPU')
+    if physical_devices:
+        for device in physical_devices:
+            tf.config.experimental.set_memory_growth(device, True)
+    
+    # 明确指定使用两个GPU
     strategy = tf.distribute.MirroredStrategy()
     print(f'Number of devices: {strategy.num_replicas_in_sync}')
     
     with strategy.scope():
         model = DeepLabV3Plus()
         
-        initial_learning_rate = 3e-4  # 适当提高学习率
+        # T4性能不如V100，适当调整学习率
+        initial_learning_rate = 3e-4
         optimizer = tf.keras.optimizers.Adam(learning_rate=initial_learning_rate)
         
         # 启用混合精度训练以提高性能
         policy = tf.keras.mixed_precision.Policy('mixed_float16')
         tf.keras.mixed_precision.set_global_policy(policy)
         
+        # 添加优化器配置，使用混合精度更有效
+        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(
+            tf.keras.optimizers.Adam(learning_rate=initial_learning_rate)
+        )
+        
+        # 编译时添加优化器配置
         model.compile(
             optimizer=optimizer,
             loss=combined_loss,
             metrics=[dice_coef, iou_metric],
-            experimental_steps_per_execution=2  # 使用较小的梯度累积步数
+            # 不添加steps_per_execution避免兼容性问题
         )
 
     # 更激进的回调函数设置
     callbacks = [
         ModelCheckpoint(
-            'deeplabv3plus_mbv3_best.h5',
+            'deeplabv3plus_mbv3_best.keras',
             monitor='val_iou_metric',
             mode='max',
             save_best_only=True,
@@ -391,7 +405,7 @@ def train():
     plt.show()
 
     # 保存模型
-    model.save('deeplabv3plus_mbv3_final.h5')
+    model.save('deeplabv3plus_mbv3_final.keras')
     print("模型训练完成并保存")
     
     return train_dataset  # 返回训练数据集供convert函数使用
@@ -400,7 +414,7 @@ def convert():
     print("开始转换TFLite模型...")
     # 加载最佳模型
     model = tf.keras.models.load_model(
-        'deeplabv3plus_mbv3_best.h5',
+        'deeplabv3plus_mbv3_best.keras',
         custom_objects={
             'dice_coef': dice_coef,
             'dice_loss': dice_loss,
@@ -458,7 +472,7 @@ def convert_test():
     """
     print("1. 开始加载模型...")
     model = tf.keras.models.load_model(
-        'deeplabv3plus_mbv3_best.h5',
+        'deeplabv3plus_mbv3_best.keras',
         custom_objects={
             'dice_coef': dice_coef,
             'dice_loss': dice_loss,
@@ -495,7 +509,7 @@ def convert_test():
     
     return 'doc_scanner_mbv3_test.tflite'
 
-def test_tflite_model(tflite_model_path='doc_scanner_mbv3.tflite'):
+def test_tflite_model(tflite_model_path='doc_scanner_mbv3_test.tflite'):
     """测试TFLite模型的推理效果"""
     print("开始测试TFLite模型...")
     
@@ -568,6 +582,9 @@ def test_tflite_model(tflite_model_path='doc_scanner_mbv3.tflite'):
 
 # 使用示例:
 if __name__ == "__main__":
+    # 设置环境变量以减少警告
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+    
     # 获取数据路径并创建数据集
     image_paths, mask_paths = get_dataset_paths()
     
