@@ -31,7 +31,7 @@ tf.config.threading.set_intra_op_parallelism_threads(6)  # 预留部分核心给
 # 模型训练参数 - 针对V100单卡 + 12核CPU优化
 TRAIN_LEN = 0
 VAL_LEN = 0
-EPOCHS = 3
+EPOCHS = 50
 NUM_CLASSES = 2
 
 # 更平衡的配置 - 针对384*480原始图像
@@ -689,11 +689,11 @@ if __name__ == "__main__":
     # test_model_path = convert_test(trained_model)
     
     # 转换为开发版模型 - 使用动态范围量化，速度适中
-    print("\n转换为开发版TFLite模型(动态范围量化)...")
-    dev_model_path = convert(trained_model)
+    # print("\n转换为开发版TFLite模型(动态范围量化)...")
+    # dev_model_path = convert(trained_model)
     
     # 如果需要生产版模型，可以取消注释下面的代码
-    # print("\n转换为生产版TFLite模型(完整INT8量化)...")
-    # prod_model_path = convert_production(trained_model)
+    print("\n转换为生产版TFLite模型(完整INT8量化)...")
+    prod_model_path = convert_production(trained_model)
     
     print("\n=== 训练和转换过程完成 ===")
