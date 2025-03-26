@@ -6,11 +6,12 @@ import glob
 import numpy as np
 import matplotlib.pyplot as plt
 
-# 在导入TensorFlow前设置环境变量以优化性能
+# 在导入TensorFlow前设置关键环境变量 - 优化V100单卡训练
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 减少日志输出
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
-os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # 动态显存分配
 os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=2'  # 强制XLA优化
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'  # GPU线程模式优化
+os.environ['TF_CUDNN_DETERMINISTIC'] = '0'  # 禁用确定性，提高性能
 
 import tensorflow as tf
 from tensorflow.keras.applications import MobileNetV3Large
@@ -20,142 +21,140 @@ from sklearn.model_selection import train_test_split
 import cv2
 import gc
 
-# 启用混合精度训练 - 提高速度和减少显存需求
-tf.keras.mixed_precision.set_global_policy('mixed_float16')
+# V100 32GB显存优化配置
+tf.keras.mixed_precision.set_global_policy('mixed_float16')  # 使用混合精度训练
 
-# 适用于4*V100的高性能配置
+# 早期TF线程配置 - 必须在任何TF操作前设置
+tf.config.threading.set_inter_op_parallelism_threads(4)  # 12核CPU优化
+tf.config.threading.set_intra_op_parallelism_threads(6)  # 预留部分核心给系统
+
+# 模型训练参数 - 针对V100单卡 + 12核CPU优化
 TRAIN_LEN = 0
 VAL_LEN = 0
 EPOCHS = 50
 NUM_CLASSES = 2
 
-# 超高性能设置
-IMG_SIZE = 384  # 提高分辨率利用强大显卡
-BATCH_SIZE = 128  # 4个V100可以处理更大批量
+# 优化的硬件参数
+IMG_SIZE = 448      # 增大到448x448，充分利用32GB显存提高精度
+BATCH_SIZE = 24     # 针对12核CPU限制的适中批量
 
-# 发布参数
-# TRAIN_LEN = 0
-# VAL_LEN = 0
-# IMG_SIZE = 384
-# BATCH_SIZE = 8
-# EPOCHS = 50
-# NUM_CLASSES = 2  # 背景和文档
-
-
+# GPU配置优化
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"找到GPU: {len(gpus)}个")
+    except RuntimeError as e:
+        print(e)
 
 train_dataset = None
 val_dataset = None
 
-
-# 1. 数据准备, 图片尺寸大概384*500左右
-def get_dataset_paths(images_dir='/mnt/data/scan/document_dataset_resized/train/images', masks_dir='/mnt/data/scan/document_dataset_resized/train/masks'):
+# 数据准备函数保持不变
+def get_dataset_paths(images_dir='/mnt/data/scan/document_dataset_resized/train/images', 
+                      masks_dir='/mnt/data/scan/document_dataset_resized/train/masks'):
     image_paths = sorted(glob.glob(os.path.join(images_dir, '*.png')))
     mask_paths = sorted(glob.glob(os.path.join(masks_dir, '*.png')))
 
-    # 限制返回的数据集大小为指定的训练和验证长度
     if TRAIN_LEN > 0 and len(image_paths) > TRAIN_LEN + VAL_LEN:
         image_paths = image_paths[:TRAIN_LEN + VAL_LEN]
         mask_paths = mask_paths[:TRAIN_LEN + VAL_LEN]
 
-    print(len(image_paths))
-    print(len(mask_paths))
-    # 确保图像和掩码数量一致
+    print(f"找到图像: {len(image_paths)}张")
+    print(f"找到掩码: {len(mask_paths)}张")
     assert len(image_paths) == len(mask_paths), "图像和掩码数量不匹配!"
 
     return image_paths, mask_paths
 
-# 数据增强
+# 针对12核CPU优化的数据增强 - 保持基本增强但减少计算量
 @tf.function
-def data_augmentation(image, mask):
-    # 50%几率应用增强
+def optimized_data_augmentation(image, mask):
+    # 随机翻转 - 计算简单的数据增强
     if tf.random.uniform(()) > 0.5:
-        # 随机翻转
         image = tf.image.random_flip_left_right(image)
         mask = tf.image.random_flip_left_right(mask)
-
-    # 随机亮度、对比度和饱和度
-    image = tf.image.random_brightness(image, 0.1)
-    image = tf.image.random_contrast(image, 0.9, 1.1)
-    image = tf.image.random_saturation(image, 0.9, 1.1)
-
-    # 保持值在[0,1]范围内
+    
+    # 简化的亮度调整 - 仅使用一种增强减轻CPU负担
+    image = tf.image.random_brightness(image, 0.1)    
     image = tf.clip_by_value(image, 0, 1)
-
+    
     return image, mask
 
-# 解析图像和掩码
+# 图像解析函数 - 优化resize操作
 @tf.function
 def parse_image(img_path, mask_path):
-    # 读取图像
+    # 读取图像 - 使用nearest邻近插值加速处理
     image = tf.io.read_file(img_path)
     image = tf.image.decode_jpeg(image, channels=3)
-    image = tf.image.resize(image, [IMG_SIZE, IMG_SIZE])
+    image = tf.image.resize(image, [IMG_SIZE, IMG_SIZE], 
+                          method='bilinear')  # 高质量调整
     image = tf.cast(image, tf.float32) / 255.0
 
-    # 读取掩码
+    # 读取掩码 - 使用快速的nearest插值
     mask = tf.io.read_file(mask_path)
     mask = tf.image.decode_png(mask, channels=1)
-    mask = tf.image.resize(mask, [IMG_SIZE, IMG_SIZE], method='nearest')
-    mask = tf.cast(mask > 0, tf.float32)  # 二值化掩码
+    mask = tf.image.resize(mask, [IMG_SIZE, IMG_SIZE], 
+                         method='nearest')  # 掩码用nearest更合适
+    mask = tf.cast(mask > 0, tf.float32)
 
     return image, mask
 
-# 优化数据加载函数，减轻CPU负担
+# V100+12核CPU优化的数据加载函数
 def create_dataset(image_paths, mask_paths, training=True):
     AUTOTUNE = tf.data.AUTOTUNE
     
-    # 设置高性能options
+    # 最佳配置选项
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
-    options.deterministic = False
+    options.deterministic = False  # 提高性能
     options.experimental_optimization.map_parallelization = True
-    options.experimental_optimization.map_and_batch_fusion = True
-    options.experimental_optimization.parallel_batch = True
     
-    # 使用全部数据 - 强大的硬件可以处理
+    # 重要: 禁用可能增加CPU负担的高级优化
+    options.experimental_optimization.map_and_batch_fusion = False
     
     # 创建数据集
     dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
     dataset = dataset.with_options(options)
     
-    # 利用32核CPU的并行性能
+    # 针对12核CPU优化的并行处理设置
     if training:
-        dataset = dataset.shuffle(buffer_size=5000)  # 大内存允许更大shuffle buffer
-        dataset = dataset.map(parse_image, num_parallel_calls=16)  # 利用多核性能
-        dataset = dataset.map(data_augmentation, num_parallel_calls=16)  # 使用完整数据增强
-        dataset = dataset.repeat()
+        # 适中的shuffle buffer - 根据92GB内存调整
+        dataset = dataset.shuffle(buffer_size=2000)
+        
+        # 减少并行调用数 - 避免CPU过载
+        dataset = dataset.map(parse_image, num_parallel_calls=4)
+        dataset = dataset.map(optimized_data_augmentation, num_parallel_calls=4)
+        
+        # 使用适中的批量大小
         dataset = dataset.batch(BATCH_SIZE)
+        dataset = dataset.repeat()  # 放在batch后面可减少内存使用
     else:
-        dataset = dataset.map(parse_image, num_parallel_calls=16)
+        dataset = dataset.map(parse_image, num_parallel_calls=2)  # 验证集减少并行度
         dataset = dataset.batch(BATCH_SIZE)
     
-    # 预取更多批次以避免GPU等待
-    dataset = dataset.prefetch(buffer_size=AUTOTUNE)
+    # 预取操作 - 减小预取量降低内存压力
+    dataset = dataset.prefetch(buffer_size=2)  # 固定小预取值减轻内存压力
+    
     return dataset
 
-# 优化点4: 简化数据增强函数，减轻CPU负担
-@tf.function
-def simple_data_augmentation(image, mask):
-    # 简化增强操作，只保留最重要的部分
-    if tf.random.uniform(()) > 0.5:
-        # 只做水平翻转
-        image = tf.image.random_flip_left_right(image)
-        mask = tf.image.random_flip_left_right(mask)
-    
-    # 移除亮度、对比度等重复处理
-    return image, mask
-
-# 2. 创建DeepLabV3+模型
+# DeepLabV3+ 模型 - 针对32GB V100显存优化
 def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     # 基础模型 - MobileNetV3Large
     base_model = MobileNetV3Large(
         input_shape=input_shape,
         include_top=False,
-        weights=None,  # 先不加载预训练权重
+        weights=None,
         minimalistic=True
     )
     
-    # 加载预训练权重到基础模型
+    # 打印层名称以便调试
+    print("模型层名称:")
+    for i, layer in enumerate(base_model.layers):
+        if "project" in layer.name and i < 50:  # 只打印前面的层
+            print(f"{i}: {layer.name}")
+    
+    # 加载预训练权重
     temp_model = MobileNetV3Large(
         input_shape=(224, 224, 3),
         include_top=False,
@@ -163,120 +162,113 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
         minimalistic=True
     )
     
-    # 复制可以共享的权重
+    # 复制权重
     for layer, temp_layer in zip(base_model.layers, temp_model.layers):
-        if layer.name == temp_layer.name:  # 确保层名称匹配
+        if layer.name == temp_layer.name:
             try:
                 layer.set_weights(temp_layer.get_weights())
             except ValueError:
                 print(f"跳过层 {layer.name} 的权重加载")
     
-    # 冻结早期层
-    for layer in base_model.layers[:100]:
+    # 针对V100性能冻结较少的早期层 - 提高模型表达能力
+    for layer in base_model.layers[:80]:  # 从100减少到80
         layer.trainable = False
 
     # 获取特征图
     input_image = base_model.input
-
-    # 修改这里：使用正确的层名称 (expanded_conv_3_project 而不是 expanded_conv_3/project)
-    low_level_features = base_model.get_layer('expanded_conv_3_project').output
-    low_level_features = tf.keras.layers.Conv2D(48, 1, padding='same',
+    
+    # 修改这里：使用正确的层名称 'expanded_conv_3/project' 替代 'expanded_conv_3_project'
+    low_level_features = base_model.get_layer('expanded_conv_3/project').output
+    
+    # 增加特征通道 - 利用32GB显存提高表达能力
+    low_level_features = tf.keras.layers.Conv2D(64, 1, padding='same',  # 从48增加到64
                                               use_bias=False)(low_level_features)
     low_level_features = tf.keras.layers.BatchNormalization()(low_level_features)
     low_level_features = tf.keras.layers.Activation('relu')(low_level_features)
 
-    # ASPP (Atrous Spatial Pyramid Pooling)
+    # ASPP - 利用V100增强处理能力
     x = base_model.output
-
-    # 获取特征图尺寸 - 注意这里只获取一次确保一致性
     x_shape = tf.keras.backend.int_shape(x)
     
-    # 1x1卷积
-    aspp_conv1 = tf.keras.layers.Conv2D(128, 1, padding='same', use_bias=False)(x)
+    # 增加特征通道数 - 利用32GB显存提高表达能力
+    aspp_conv1 = tf.keras.layers.Conv2D(160, 1, padding='same', use_bias=False)(x)  # 从128增加到160
     aspp_conv1 = tf.keras.layers.BatchNormalization()(aspp_conv1)
     aspp_conv1 = tf.keras.layers.Activation('relu')(aspp_conv1)
 
-    # 空洞卷积率=6
-    aspp_conv2 = tf.keras.layers.Conv2D(128, 3, padding='same', dilation_rate=6, use_bias=False)(x)
+    # 空洞卷积
+    aspp_conv2 = tf.keras.layers.Conv2D(160, 3, padding='same', dilation_rate=6, use_bias=False)(x)
     aspp_conv2 = tf.keras.layers.BatchNormalization()(aspp_conv2)
     aspp_conv2 = tf.keras.layers.Activation('relu')(aspp_conv2)
 
-    # 空洞卷积率=12
-    aspp_conv3 = tf.keras.layers.Conv2D(128, 3, padding='same', dilation_rate=12, use_bias=False)(x)
+    aspp_conv3 = tf.keras.layers.Conv2D(160, 3, padding='same', dilation_rate=12, use_bias=False)(x)
     aspp_conv3 = tf.keras.layers.BatchNormalization()(aspp_conv3)
     aspp_conv3 = tf.keras.layers.Activation('relu')(aspp_conv3)
 
-    # 全局平均池化 - 修改上采样方式
+    # 全局池化
     aspp_pool = tf.keras.layers.GlobalAveragePooling2D()(x)
     aspp_pool = tf.keras.layers.Reshape((1, 1, -1))(aspp_pool)
-    aspp_pool = tf.keras.layers.Conv2D(128, 1, padding='same', use_bias=False)(aspp_pool)  # 修改为128保持一致
+    aspp_pool = tf.keras.layers.Conv2D(160, 1, padding='same', use_bias=False)(aspp_pool)
     aspp_pool = tf.keras.layers.BatchNormalization()(aspp_pool)
     aspp_pool = tf.keras.layers.Activation('relu')(aspp_pool)
     
-    # 根据x的实际尺寸动态上采样
     aspp_pool = tf.keras.layers.UpSampling2D(
-        size=(x_shape[1], x_shape[2]),  # 直接使用x的高度和宽度
+        size=(x_shape[1], x_shape[2]),
         interpolation='bilinear'
     )(aspp_pool)
 
     # 合并ASPP分支
     aspp_concat = tf.keras.layers.Concatenate()([aspp_conv1, aspp_conv2, aspp_conv3, aspp_pool])
-    aspp_concat = tf.keras.layers.Conv2D(128, 1, padding='same', use_bias=False)(aspp_concat)  # 从256减少到128通道
+    aspp_concat = tf.keras.layers.Conv2D(160, 1, padding='same', use_bias=False)(aspp_concat)
     
     # 上采样ASPP特征
     aspp_upsampled = tf.keras.layers.UpSampling2D(size=(4, 4),
                                                 interpolation='bilinear')(aspp_concat)
 
-    # 计算上采样比例
+    # 确保特征尺寸匹配
     upsample_ratio = aspp_upsampled.shape[1] // low_level_features.shape[1]
     if upsample_ratio < 1:
         upsample_ratio = 1
 
-    # 上采样低级特征以匹配ASPP特征的尺寸
     low_level_features = tf.keras.layers.UpSampling2D(
         size=(upsample_ratio, upsample_ratio),
         interpolation='bilinear'
     )(low_level_features)
 
-    # 如果尺寸不匹配，使用padding或crop进行调整
     if low_level_features.shape[1] != aspp_upsampled.shape[1]:
         low_level_features = tf.keras.layers.Cropping2D(
             cropping=((0, low_level_features.shape[1] - aspp_upsampled.shape[1]),
                      (0, low_level_features.shape[2] - aspp_upsampled.shape[2]))
         )(low_level_features)
 
-    # 合并低级特征和ASPP特征
+    # 合并特征
     decoder_concat = tf.keras.layers.Concatenate()([aspp_upsampled, low_level_features])
 
-    # 解码器，移除 dropout
-    decoder = tf.keras.layers.Conv2D(128, 3, padding='same', activation='relu')(decoder_concat)  # 从256减少到128通道
-    decoder = tf.keras.layers.Conv2D(128, 3, padding='same', activation='relu')(decoder)  # 从256减少到128通道
+    # 解码器 - 利用V100增加特征通道
+    decoder = tf.keras.layers.Conv2D(160, 3, padding='same', activation='relu')(decoder_concat)
+    decoder = tf.keras.layers.Conv2D(160, 3, padding='same', activation='relu')(decoder)
 
-    # 计算最终上采样比例
+    # 最终上采样
     final_upsample_ratio = input_shape[0] // decoder.shape[1]
-    
-    # 最终上采样和预测
     decoder = tf.keras.layers.UpSampling2D(size=(final_upsample_ratio, final_upsample_ratio),
                                          interpolation='bilinear')(decoder)
-    # 修改输出通道数为1
+    
+    # 输出层
     outputs = tf.keras.layers.Conv2D(1, 1, padding='same')(decoder)
 
     # 创建模型
     model = tf.keras.Model(inputs=input_image, outputs=outputs)
     return model
 
-# 3. 定义损失函数和评估指标
+# 损失函数和评估指标保持不变
 def dice_coef(y_true, y_pred, smooth=1e-6):
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(tf.keras.backend.sigmoid(y_pred), tf.float32)
     
-    # 确保输入是4D张量 [batch_size, height, width, channels]
     if len(y_true.shape) == 3:
         y_true = tf.expand_dims(y_true, axis=-1)
     if len(y_pred.shape) == 3:
         y_pred = tf.expand_dims(y_pred, axis=-1)
     
-    # 展平预测值和真实值
     y_true_f = tf.reshape(y_true, [-1])
     y_pred_f = tf.reshape(y_pred, [-1])
     
@@ -290,12 +282,10 @@ def binary_focal_loss(y_true, y_pred, gamma=2., alpha=.25):
     epsilon = tf.keras.backend.epsilon()
     y_pred = tf.clip_by_value(tf.keras.backend.sigmoid(y_pred), epsilon, 1. - epsilon)
     
-    # 确保输入是4D张量
     y_true = tf.cast(y_true, tf.float32)
     if len(y_true.shape) == 3:
         y_true = tf.expand_dims(y_true, axis=-1)
     
-    # 计算focal loss
     p_t = tf.where(tf.equal(y_true, 1), y_pred, 1 - y_pred)
     alpha_t = tf.where(tf.equal(y_true, 1), alpha, 1 - alpha)
     
@@ -303,7 +293,6 @@ def binary_focal_loss(y_true, y_pred, gamma=2., alpha=.25):
     return tf.reduce_mean(focal_loss)
 
 def combined_loss(y_true, y_pred):
-    # 确保输入是4D张量
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(y_pred, tf.float32)
     
@@ -315,7 +304,6 @@ def combined_loss(y_true, y_pred):
     return dice_loss(y_true, y_pred) + binary_focal_loss(y_true, y_pred)
 
 def iou_metric(y_true, y_pred, smooth=1e-6):
-    # 确保输入是4D张量
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(tf.keras.backend.sigmoid(y_pred) > 0.5, tf.float32)
     
@@ -324,7 +312,6 @@ def iou_metric(y_true, y_pred, smooth=1e-6):
     if len(y_pred.shape) == 3:
         y_pred = tf.expand_dims(y_pred, axis=-1)
     
-    # 展平预测值和真实值
     y_true_f = tf.reshape(y_true, [-1])
     y_pred_f = tf.reshape(y_pred, [-1])
     
@@ -332,82 +319,92 @@ def iou_metric(y_true, y_pred, smooth=1e-6):
     union = tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) - intersection
     return (intersection + smooth) / (union + smooth)
 
+# 针对单V100优化的训练函数
 def train():
     # 内存清理
     gc.collect()
     
-    # 启用XLA加速
+    # 启用XLA加速 - 优化V100性能
     tf.config.optimizer.set_jit(True)
     
-    # 配置并行线程 - 适合32核CPU
-    tf.config.threading.set_inter_op_parallelism_threads(8)  # 预留部分核心给系统
-    tf.config.threading.set_intra_op_parallelism_threads(16)
+    # 检查GPU配置 - 适应单V100
+    physical_devices = tf.config.list_physical_devices('GPU')
+    if physical_devices:
+        print(f"训练将使用 {len(physical_devices)} 个GPU")
+        # 修复GPU内存信息获取问题
+        try:
+            # 直接输出设备信息，不尝试获取内存信息
+            for i, device in enumerate(physical_devices):
+                print(f"  GPU #{i}: {device.name}")
+        except Exception as e:
+            print(f"无法获取GPU内存信息: {e}")
+    else:
+        print("警告: 未检测到GPU，训练将使用CPU")
     
-    # 为多GPU训练配置MirroredStrategy
-    strategy = tf.distribute.MirroredStrategy()
-    print(f'使用 {strategy.num_replicas_in_sync} 个GPU进行训练')
+    # V100的合适学习率
+    initial_learning_rate = 4e-4
     
-    # 根据多GPU调整学习率
-    global_batch_size = BATCH_SIZE * strategy.num_replicas_in_sync
-    initial_learning_rate = 5e-4 * strategy.num_replicas_in_sync  # 根据GPU数量线性扩展学习率
+    # 模型创建
+    model = DeepLabV3Plus()
     
-    # 使用strategy.scope()创建模型和优化器
-    with strategy.scope():
-        # 模型创建
-        model = DeepLabV3Plus()
-        
-        # 针对多GPU训练的优化器设置
-        optimizer = tf.keras.optimizers.Adam(
-            learning_rate=initial_learning_rate,
-            beta_1=0.9,
-            beta_2=0.999,
-            epsilon=1e-7
-        )
-        
-        # 编译模型
-        model.compile(
-            optimizer=optimizer,
-            loss=combined_loss,
-            metrics=[dice_coef, iou_metric]
-        )
+    # 优化器配置 - 针对V100和混合精度训练
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=initial_learning_rate,
+        beta_1=0.9,
+        beta_2=0.999,
+        epsilon=1e-7
+    )
     
-    # 回调函数
+    # 编译模型
+    model.compile(
+        optimizer=optimizer,
+        loss=combined_loss,
+        metrics=[dice_coef, iou_metric]
+    )
+    
+    # 回调函数优化
     callbacks = [
         ModelCheckpoint(
             'deeplabv3plus_mbv3_best.keras',
             monitor='val_iou_metric',
             mode='max',
             save_best_only=True,
-            verbose=1
+            verbose=1,
+            save_weights_only=False  # 保存完整模型便于后续转换
         ),
         ReduceLROnPlateau(
             monitor='val_loss',
-            factor=0.5,
+            factor=0.7,  # 更温和的学习率调整
             patience=3,
-            min_lr=1e-6,
+            min_lr=5e-6,
             verbose=1
         ),
         EarlyStopping(
             monitor='val_loss',
-            patience=8,
+            patience=7,
             restore_best_weights=True,
             verbose=1
         ),
         # 添加TensorBoard回调以监控训练
         tf.keras.callbacks.TensorBoard(
             log_dir='./logs',
-            update_freq=50
+            update_freq=100,  # 减少写入频率降低IO负担
+            profile_batch=0  # 禁用分析以提高性能
         )
     ]
     
-    # 使用全部数据训练
+    # 训练模型 - 使用优化数据集
+    print("\n开始训练模型...")
     history = model.fit(
         train_dataset,
         epochs=EPOCHS,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_dataset,
         callbacks=callbacks,
-        verbose=1
+        verbose=1,
+        max_queue_size=10,  # 限制队列大小减少内存使用
+        workers=1,  # 单线程数据加载减轻CPU负担
+        use_multiprocessing=False  # 避免多进程导致的CPU过载
     )
     
     # 保存模型
@@ -416,6 +413,7 @@ def train():
     
     return train_dataset
 
+# TFLite转换函数保持基本不变
 def convert():
     print("开始转换TFLite模型...")
     # 加载最佳模型
@@ -430,31 +428,21 @@ def convert():
         }
     )
 
-    # 优化模型结构用于推断
-    def preprocess_input(x):
-        return x
-
-    def post_processing(x):
-        return tf.sigmoid(x)
-
     # 创建推断模型
     input_tensor = tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-    preprocessed = tf.keras.layers.Lambda(preprocess_input)(input_tensor)
-    features = model(preprocessed)
-    outputs = tf.keras.layers.Lambda(post_processing)(features)
+    outputs = model(input_tensor)
+    outputs = tf.keras.layers.Activation('sigmoid')(outputs)
     inference_model = tf.keras.Model(inputs=input_tensor, outputs=outputs)
 
-    # TFLite转换
+    # TFLite转换配置
     converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
-    
-    # 修改这里：添加额外的配置
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.target_spec.supported_ops = [
-        tf.lite.OpsSet.TFLITE_BUILTINS,  # 添加对基本运算的支持
-        tf.lite.OpsSet.SELECT_TF_OPS     # 添加对TF运算的支持
+        tf.lite.OpsSet.TFLITE_BUILTINS,
+        tf.lite.OpsSet.SELECT_TF_OPS
     ]
     
-    # 量化配置
+    # 量化配置 - 利用训练数据集
     def representative_dataset():
         for image_batch, _ in train_dataset.take(100):
             for image in image_batch:
@@ -465,157 +453,52 @@ def convert():
     converter.inference_input_type = tf.uint8
     converter.inference_output_type = tf.uint8
 
-    # 转换并保存模型
+    # 执行转换
+    print("正在转换模型(可能需要几分钟)...")
     tflite_model = converter.convert()
+    
+    # 保存模型
     with open('doc_scanner_mbv3.tflite', 'wb') as f:
         f.write(tflite_model)
     print("TFLite模型已保存")
     print(f"TFLite模型大小: {len(tflite_model) / (1024 * 1024):.2f} MB")
+    
+    return 'doc_scanner_mbv3.tflite'
 
-def convert_test():
-    """
-    用于测试的TFLite转换函数，去掉量化步骤以加快转换速度
-    """
-    print("1. 开始加载模型...")
-    model = tf.keras.models.load_model(
-        'deeplabv3plus_mbv3_best.keras',
-        custom_objects={
-            'dice_coef': dice_coef,
-            'dice_loss': dice_loss,
-            'binary_focal_loss': binary_focal_loss,
-            'combined_loss': combined_loss,
-            'iou_metric': iou_metric
-        }
-    )
-
-    print("2. 创建推断模型...")
-    # 创建简单的推断模型
-    input_tensor = tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-    outputs = model(input_tensor)
-    outputs = tf.keras.layers.Activation('sigmoid')(outputs)  # 添加sigmoid激活函数
-    inference_model = tf.keras.Model(inputs=input_tensor, outputs=outputs)
-
-    print("3. 配置转换器...")
-    # 简单的TFLite转换配置
-    converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
-    converter.target_spec.supported_ops = [
-        tf.lite.OpsSet.TFLITE_BUILTINS,
-        tf.lite.OpsSet.SELECT_TF_OPS
-    ]
-
-    print("4. 开始转换(这可能需要几分钟)...")
-    tflite_model = converter.convert()
-
-    print("5. 保存模型...")
-    with open('doc_scanner_mbv3_test.tflite', 'wb') as f:
-        f.write(tflite_model)
-    
-    print("转换完成!")
-    print(f"TFLite模型大小: {len(tflite_model) / (1024 * 1024):.2f} MB")
-    
-    return 'doc_scanner_mbv3_test.tflite'
-
-def test_tflite_model(tflite_model_path='doc_scanner_mbv3_test.tflite'):
-    """测试TFLite模型的推理效果"""
-    print("开始测试TFLite模型...")
-    
-    # 加载TFLite模型
-    interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
-    interpreter.allocate_tensors()
-
-    # 获取输入输出细节
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-
-    print("\n模型信息:")
-    print("输入详情:", input_details)
-    print("输出详情:", output_details)
-
-    # 从验证集获取一个样本进行测试
-    for images, masks in val_dataset.take(1):
-        test_image = images[0]
-        test_mask = masks[0]
-        break
-
-    # 预处理图像
-    input_shape = input_details[0]['shape']
-    test_image_uint8 = tf.cast(test_image * 255, tf.uint8).numpy()
-    
-    # 设置输入张量
-    interpreter.set_tensor(input_details[0]['index'], tf.expand_dims(test_image_uint8, 0))
-    
-    # 运行推理
-    print("\n执行推理...")
-    interpreter.invoke()
-    
-    # 获取输出
-    output = interpreter.get_tensor(output_details[0]['index'])
-    output = output.astype(np.float32) / 255.0  # 从uint8转回float32
-    
-    # 显示结果
-    plt.figure(figsize=(15, 5))
-    
-    # 显示原始图像
-    plt.subplot(1, 3, 1)
-    plt.imshow(test_image)
-    plt.title('original image')
-    plt.axis('off')
-    
-    # 显示真实掩码
-    plt.subplot(1, 3, 2)
-    plt.imshow(test_mask, cmap='gray')
-    plt.title('ground truth mask')
-    plt.axis('off')
-    
-    # 显示预测结果
-    plt.subplot(1, 3, 3)
-    plt.imshow(output[0,:,:,0], cmap='gray')
-    plt.title('TFLite prediction')
-    plt.axis('off')
-    
-    plt.tight_layout()
-    plt.savefig('tflite_test_result.png')
-    plt.show()
-    
-    print("\n测试完成! 结果已保存为 'tflite_test_result.png'")
-    
-    # 计算性能指标
-    pred_mask = output[0,:,:,0] > 0.5
-    true_mask = test_mask.numpy() > 0.5
-    
-    iou = np.sum(pred_mask & true_mask) / np.sum(pred_mask | true_mask)
-    print(f"\n测试样本的IoU: {iou:.4f}")
-
-# 使用示例:
+# 主函数优化
 if __name__ == "__main__":
-    # 设置环境变量以减少警告
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+    print("\n=== 开始文档扫描分割模型训练 ===")
+    print(f"TensorFlow版本: {tf.__version__}")
+    print(f"GPU配置: V100 (32GB)")
+    print(f"混合精度训练: {'已启用' if tf.keras.mixed_precision.global_policy().name == 'mixed_float16' else '未启用'}")
+    print(f"训练分辨率: {IMG_SIZE}x{IMG_SIZE}")
+    print(f"批量大小: {BATCH_SIZE}")
     
-    # 获取数据路径并创建数据集
+    # 获取数据路径
     image_paths, mask_paths = get_dataset_paths()
     
-    # 分割训练和验证集
+    # 训练验证分割 - 增加训练集比例
     train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = train_test_split(
-        image_paths, mask_paths, test_size=0.15, random_state=42)  # 减少验证集比例以增加训练集
+        image_paths, mask_paths, test_size=0.15, random_state=42)
     
-    # 计算steps_per_epoch - 考虑多卡训练
-    steps_per_epoch = len(train_img_paths) // (BATCH_SIZE * 4)  # 4个GPU
+    # 根据实际数据集大小计算steps_per_epoch
+    steps_per_epoch = len(train_img_paths) // BATCH_SIZE
     steps_per_epoch = max(1, steps_per_epoch)
     
-    print(f"训练集大小: {len(train_img_paths)}")
-    print(f"验证集大小: {len(val_img_paths)}")
+    print(f"训练集大小: {len(train_img_paths)}张图像")
+    print(f"验证集大小: {len(val_img_paths)}张图像")
     print(f"每轮训练步数: {steps_per_epoch}")
     
-    # 创建分布式训练优化的数据集
+    # 创建优化的数据集
+    print("\n准备数据集中...")
     train_dataset = create_dataset(train_img_paths, train_mask_paths, training=True)
     val_dataset = create_dataset(val_img_paths, val_mask_paths, training=False)
     
-    # 使用全部训练数据
-    # 无需限制TRAIN_SUBSET - 强大硬件可以处理全部数据
-    
     # 训练模型
+    print("\n配置完成，开始训练...")
     train()
     
-    # 转换为TFLite并测试
+    # 转换为TFLite
     convert()
-    test_tflite_model('doc_scanner_mbv3_test.tflite')  # 使用完全量化的模型
+    
+    print("\n=== 训练和转换过程完成 ===")
