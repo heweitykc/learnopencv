@@ -369,8 +369,7 @@ def train():
             monitor='val_iou_metric',
             mode='max',
             save_best_only=True,
-            verbose=1,
-            save_weights_only=False  # 保存完整模型便于后续转换
+            verbose=1
         ),
         ReduceLROnPlateau(
             monitor='val_loss',
@@ -393,7 +392,7 @@ def train():
         )
     ]
     
-    # 训练模型 - 使用优化数据集
+    # 训练模型 - 使用优化数据集，且移除不支持的选项
     print("\n开始训练模型...")
     history = model.fit(
         train_dataset,
@@ -401,15 +400,20 @@ def train():
         steps_per_epoch=steps_per_epoch,
         validation_data=val_dataset,
         callbacks=callbacks,
-        verbose=1,
-        max_queue_size=10,  # 限制队列大小减少内存使用
-        workers=1,  # 单线程数据加载减轻CPU负担
-        use_multiprocessing=False  # 避免多进程导致的CPU过载
+        verbose=1
     )
     
-    # 保存模型
-    model.save('deeplabv3plus_mbv3_final.keras')
-    print("模型训练完成并保存")
+    # 保存模型 - 使用更简单的保存方式
+    try:
+        print("保存最终模型...")
+        model.save('deeplabv3plus_mbv3_final.keras', save_format='keras_v3')
+    except Exception as e:
+        print(f"保存模型时出错: {e}")
+        # 尝试使用备选方案
+        model.save_weights('deeplabv3plus_mbv3_final_weights.h5')
+        print("已保存模型权重")
+    
+    print("模型训练完成")
     
     return train_dataset
 
@@ -463,6 +467,27 @@ def convert():
     print("TFLite模型已保存")
     print(f"TFLite模型大小: {len(tflite_model) / (1024 * 1024):.2f} MB")
     
+    # 添加保存到指定目录的功能，并在文件名中加入时间戳
+    import os
+    import datetime
+    
+    # 创建保存目录
+    save_dir = "/mnt/data/scan/"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 获取当前时间并格式化为字符串
+    current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 构建带时间戳的文件名
+    tflite_filename = f"doc_scanner_mbv3_{current_time}.tflite"
+    tflite_filepath = os.path.join(save_dir, tflite_filename)
+    
+    # 保存模型到指定目录
+    with open(tflite_filepath, 'wb') as f:
+        f.write(tflite_model)
+    
+    print(f"TFLite模型已保存到: {tflite_filepath}")
+
     return 'doc_scanner_mbv3.tflite'
 
 # 主函数优化
