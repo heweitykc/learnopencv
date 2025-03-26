@@ -34,9 +34,9 @@ VAL_LEN = 0
 EPOCHS = 3
 NUM_CLASSES = 2
 
-# 优化的硬件参数
-IMG_SIZE = 384      # 增大到448x448，充分利用32GB显存提高精度
-BATCH_SIZE = 24     # 针对12核CPU限制的适中批量
+# 更平衡的配置 - 针对384*480原始图像
+IMG_SIZE = 416       # 略微提高但不过度上采样
+BATCH_SIZE = 64      # 大幅提高批量大小充分利用V100显存
 
 # GPU配置优化
 gpus = tf.config.experimental.list_physical_devices('GPU')
@@ -181,8 +181,7 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     low_level_features = base_model.get_layer('expanded_conv_3/project').output
     
     # 增加特征通道 - 利用32GB显存提高表达能力
-    low_level_features = tf.keras.layers.Conv2D(64, 1, padding='same',  # 从48增加到64
-                                              use_bias=False)(low_level_features)
+    low_level_features = tf.keras.layers.Conv2D(128, 1, padding='same', use_bias=False)(low_level_features)  # 从64增加到128
     low_level_features = tf.keras.layers.BatchNormalization()(low_level_features)
     low_level_features = tf.keras.layers.Activation('relu')(low_level_features)
 
@@ -191,18 +190,21 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     x_shape = tf.keras.backend.int_shape(x)
     
     # 增加特征通道数 - 利用32GB显存提高表达能力
-    aspp_conv1 = tf.keras.layers.Conv2D(160, 1, padding='same', use_bias=False)(x)  # 从128增加到160
+    aspp_conv1 = tf.keras.layers.Conv2D(256, 1, padding='same', use_bias=False)(x)  # 从160增加到256
     aspp_conv1 = tf.keras.layers.BatchNormalization()(aspp_conv1)
     aspp_conv1 = tf.keras.layers.Activation('relu')(aspp_conv1)
 
     # 空洞卷积
-    aspp_conv2 = tf.keras.layers.Conv2D(160, 3, padding='same', dilation_rate=6, use_bias=False)(x)
+    aspp_conv2 = tf.keras.layers.Conv2D(256, 3, padding='same', dilation_rate=6, use_bias=False)(x)
     aspp_conv2 = tf.keras.layers.BatchNormalization()(aspp_conv2)
     aspp_conv2 = tf.keras.layers.Activation('relu')(aspp_conv2)
 
-    aspp_conv3 = tf.keras.layers.Conv2D(160, 3, padding='same', dilation_rate=12, use_bias=False)(x)
+    aspp_conv3 = tf.keras.layers.Conv2D(256, 3, padding='same', dilation_rate=12, use_bias=False)(x)
     aspp_conv3 = tf.keras.layers.BatchNormalization()(aspp_conv3)
     aspp_conv3 = tf.keras.layers.Activation('relu')(aspp_conv3)
+
+    # 增加额外空洞卷积分支
+    aspp_conv4 = tf.keras.layers.Conv2D(256, 3, padding='same', dilation_rate=18, use_bias=False)(x)  # 新增分支
 
     # 全局池化
     aspp_pool = tf.keras.layers.GlobalAveragePooling2D()(x)
@@ -217,7 +219,7 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     )(aspp_pool)
 
     # 合并ASPP分支
-    aspp_concat = tf.keras.layers.Concatenate()([aspp_conv1, aspp_conv2, aspp_conv3, aspp_pool])
+    aspp_concat = tf.keras.layers.Concatenate()([aspp_conv1, aspp_conv2, aspp_conv3, aspp_conv4, aspp_pool])  # 添加新分支
     aspp_concat = tf.keras.layers.Conv2D(160, 1, padding='same', use_bias=False)(aspp_concat)
     
     # 上采样ASPP特征
@@ -244,8 +246,9 @@ def DeepLabV3Plus(input_shape=(IMG_SIZE, IMG_SIZE, 3), num_classes=NUM_CLASSES):
     decoder_concat = tf.keras.layers.Concatenate()([aspp_upsampled, low_level_features])
 
     # 解码器 - 利用V100增加特征通道
-    decoder = tf.keras.layers.Conv2D(160, 3, padding='same', activation='relu')(decoder_concat)
-    decoder = tf.keras.layers.Conv2D(160, 3, padding='same', activation='relu')(decoder)
+    decoder = tf.keras.layers.Conv2D(256, 3, padding='same', activation='relu')(decoder_concat)
+    decoder = tf.keras.layers.Conv2D(256, 3, padding='same', activation='relu')(decoder)
+    decoder = tf.keras.layers.Conv2D(128, 3, padding='same', activation='relu')(decoder)  # 额外增加一层
 
     # 最终上采样
     final_upsample_ratio = input_shape[0] // decoder.shape[1]
@@ -336,8 +339,8 @@ def train():
     else:
         print("警告: 未检测到GPU，训练将使用CPU")
     
-    # V100的合适学习率
-    initial_learning_rate = 4e-4
+    # 按比例调整学习率，匹配更大的批量大小
+    initial_learning_rate = 8e-4  # 从4e-4调整到8e-4，因为批量大小也提高了
     
     # 模型创建
     model = DeepLabV3Plus()
@@ -387,19 +390,16 @@ def train():
         )
     ]
     
-    # 注意：为了避免与options相关的问题，我们重新创建一个没有options的数据集
-    # 这是一个临时解决方案，只为了训练过程
+    # 更高效的数据集创建
     def create_simple_training_dataset():
         global train_img_paths, train_mask_paths
         
-        # 创建简单数据集，不使用options
         dataset = tf.data.Dataset.from_tensor_slices((train_img_paths, train_mask_paths))
-        dataset = dataset.shuffle(buffer_size=1000)
-        dataset = dataset.map(parse_image, num_parallel_calls=4)
-        dataset = dataset.map(optimized_data_augmentation, num_parallel_calls=4)
-        dataset = dataset.batch(BATCH_SIZE)
+        dataset = dataset.shuffle(buffer_size=5000)  # 增大shuffle缓冲区
+        dataset = dataset.map(parse_image, num_parallel_calls=8)  # 增加并行处理
+        dataset = dataset.batch(BATCH_SIZE)  # 大批量处理
         dataset = dataset.repeat()
-        dataset = dataset.prefetch(buffer_size=2)
+        dataset = dataset.prefetch(buffer_size=AUTOTUNE)  # 让TF自动决定预取量
         return dataset
     
     def create_simple_validation_dataset():
@@ -523,6 +523,65 @@ def convert(model=None):
 
     return 'doc_scanner_mbv3.tflite'
 
+# 非量化TFLite转换函数 - 用于快速测试
+def convert_test(model=None):
+    print("开始快速转换TFLite模型(无量化)...")
+    
+    # 如果没有传入模型，尝试重新创建一个并加载权重
+    if model is None:
+        print("未传入模型，尝试创建新模型并加载权重...")
+        model = DeepLabV3Plus()
+        try:
+            model.load_weights('deeplabv3plus_mbv3_best_weights.h5')
+            print("成功加载模型权重")
+        except Exception as e:
+            print(f"加载模型权重失败: {e}")
+            return None
+
+    # 创建推断模型
+    input_tensor = tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+    outputs = model(input_tensor)
+    outputs = tf.keras.layers.Activation('sigmoid')(outputs)
+    inference_model = tf.keras.Model(inputs=input_tensor, outputs=outputs)
+
+    # 最简TFLite转换配置 - 不使用量化以加快处理
+    converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
+    
+    # 只支持基本操作，但跳过复杂量化
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS,
+        tf.lite.OpsSet.SELECT_TF_OPS
+    ]
+    
+    # 执行转换 - 应该比量化版本快很多
+    print("正在快速转换模型...")
+    tflite_model = converter.convert()
+    
+    # 保存不同名称避免混淆
+    test_model_path = 'doc_scanner_mbv3_test.tflite'
+    with open(test_model_path, 'wb') as f:
+        f.write(tflite_model)
+    print("测试TFLite模型已保存")
+    print(f"测试TFLite模型大小: {len(tflite_model) / (1024 * 1024):.2f} MB")
+    
+    # 也保存一份到时间戳目录，但带test标记
+    import os
+    import datetime
+    
+    save_dir = "/mnt/data/scan/"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    tflite_filename = f"doc_scanner_mbv3_test_{current_time}.tflite"
+    tflite_filepath = os.path.join(save_dir, tflite_filename)
+    
+    with open(tflite_filepath, 'wb') as f:
+        f.write(tflite_model)
+    
+    print(f"测试TFLite模型已保存到: {tflite_filepath}")
+
+    return test_model_path  # 返回模型路径以便进一步测试
+
 # 主函数优化
 if __name__ == "__main__":
     print("\n=== 开始文档扫描分割模型训练 ===")
@@ -556,7 +615,12 @@ if __name__ == "__main__":
     print("\n配置完成，开始训练...")
     trained_model = train()
     
-    # 转换为TFLite - 传入训练好的模型
-    convert(trained_model)
+    # 转换为无量化的测试TFLite模型 - 快速测试用
+    print("\n转换为测试TFLite模型(无量化)...")
+    test_model_path = convert_test(trained_model)
+    
+    # 转换为标准TFLite - 带量化，可选，根据需要注释掉
+    # print("\n转换为标准TFLite模型(带量化)...")
+    # convert(trained_model)
     
     print("\n=== 训练和转换过程完成 ===")
