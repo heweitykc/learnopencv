@@ -5,6 +5,13 @@ import os
 import glob
 import numpy as np
 import matplotlib.pyplot as plt
+
+# 在导入TensorFlow前设置环境变量以优化性能
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 减少日志输出
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=2'  # 强制XLA优化
+
 import tensorflow as tf
 from tensorflow.keras.applications import MobileNetV3Large
 from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
@@ -13,14 +20,18 @@ from sklearn.model_selection import train_test_split
 import cv2
 import gc
 
+# 启用混合精度训练 - 提高速度和减少显存需求
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+# 适用于4*V100的高性能配置
 TRAIN_LEN = 0
 VAL_LEN = 0
 EPOCHS = 50
 NUM_CLASSES = 2
 
-# V100 * 1, 32GB显存, 12核CPU, 92GB内存优化参数
-IMG_SIZE = 384  # 保持原分辨率，足够文档边缘检测
-BATCH_SIZE = 32  # 减小批量缓解内存压力
+# 超高性能设置
+IMG_SIZE = 384  # 提高分辨率利用强大显卡
+BATCH_SIZE = 128  # 4个V100可以处理更大批量
 
 # 发布参数
 # TRAIN_LEN = 0
@@ -93,38 +104,33 @@ def parse_image(img_path, mask_path):
 def create_dataset(image_paths, mask_paths, training=True):
     AUTOTUNE = tf.data.AUTOTUNE
     
-    # 设置options
+    # 设置高性能options
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
     options.deterministic = False
     options.experimental_optimization.map_parallelization = True
     options.experimental_optimization.map_and_batch_fusion = True
+    options.experimental_optimization.parallel_batch = True
     
-    # 优化点1: 加载前先处理解码数据，减少重复动作
-    if len(image_paths) > 1000 and training:
-        # 对于大数据集，只预加载部分数据
-        image_paths = image_paths[:1000]
-        mask_paths = mask_paths[:1000]
+    # 使用全部数据 - 强大的硬件可以处理
     
-    # 将路径转换为数据集
+    # 创建数据集
     dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
     dataset = dataset.with_options(options)
     
-    # 优化点2: 减少并行处理线程，避免CPU过载
+    # 利用32核CPU的并行性能
     if training:
-        # 减小shuffle buffer进一步减轻内存和CPU压力
-        dataset = dataset.shuffle(buffer_size=500)  # 进一步减小
-        dataset = dataset.map(parse_image, num_parallel_calls=4)  # 从6减到4
-        # 优化点3: 减少数据增强复杂度，提高速度
-        dataset = dataset.map(simple_data_augmentation, num_parallel_calls=4)
+        dataset = dataset.shuffle(buffer_size=5000)  # 大内存允许更大shuffle buffer
+        dataset = dataset.map(parse_image, num_parallel_calls=16)  # 利用多核性能
+        dataset = dataset.map(data_augmentation, num_parallel_calls=16)  # 使用完整数据增强
         dataset = dataset.repeat()
         dataset = dataset.batch(BATCH_SIZE)
     else:
-        dataset = dataset.map(parse_image, num_parallel_calls=4)
+        dataset = dataset.map(parse_image, num_parallel_calls=16)
         dataset = dataset.batch(BATCH_SIZE)
     
-    # 使用较小的预取值
-    dataset = dataset.prefetch(buffer_size=AUTOTUNE)  # AUTOTUNE让TF自行决定最优预取值
+    # 预取更多批次以避免GPU等待
+    dataset = dataset.prefetch(buffer_size=AUTOTUNE)
     return dataset
 
 # 优化点4: 简化数据增强函数，减轻CPU负担
@@ -327,50 +333,45 @@ def iou_metric(y_true, y_pred, smooth=1e-6):
     return (intersection + smooth) / (union + smooth)
 
 def train():
-    # 添加内存清理
+    # 内存清理
     gc.collect()
-    
-    # 限制TensorFlow内存增长
-    physical_devices = tf.config.list_physical_devices('GPU')
-    if physical_devices:
-        for device in physical_devices:
-            # 预留4GB给系统
-            tf.config.experimental.set_memory_growth(device, True)
-            # 限制显存使用上限
-            try:
-                tf.config.set_logical_device_configuration(
-                    device,
-                    [tf.config.LogicalDeviceConfiguration(memory_limit=26000)]  # 限制为26GB
-                )
-            except RuntimeError as e:
-                # 捕获已经初始化的运行时错误
-                print(e)
     
     # 启用XLA加速
     tf.config.optimizer.set_jit(True)
     
-    # V100性能强劲，但为稳定性略微降低学习率
-    initial_learning_rate = 3e-4  # 调低学习率以稳定训练
+    # 配置并行线程 - 适合32核CPU
+    tf.config.threading.set_inter_op_parallelism_threads(8)  # 预留部分核心给系统
+    tf.config.threading.set_intra_op_parallelism_threads(16)
     
-    # 使用标准优化器而非legacy版本
-    optimizer = tf.keras.optimizers.Adam(
-        learning_rate=initial_learning_rate,
-        beta_1=0.9,
-        beta_2=0.999,
-        epsilon=1e-7
-    )
+    # 为多GPU训练配置MirroredStrategy
+    strategy = tf.distribute.MirroredStrategy()
+    print(f'使用 {strategy.num_replicas_in_sync} 个GPU进行训练')
     
-    # 直接创建模型，不使用strategy.scope()
-    model = DeepLabV3Plus()
+    # 根据多GPU调整学习率
+    global_batch_size = BATCH_SIZE * strategy.num_replicas_in_sync
+    initial_learning_rate = 5e-4 * strategy.num_replicas_in_sync  # 根据GPU数量线性扩展学习率
     
-    # 编译模型
-    model.compile(
-        optimizer=optimizer,
-        loss=combined_loss,
-        metrics=[dice_coef, iou_metric]
-    )
-
-    # 更激进的回调函数设置
+    # 使用strategy.scope()创建模型和优化器
+    with strategy.scope():
+        # 模型创建
+        model = DeepLabV3Plus()
+        
+        # 针对多GPU训练的优化器设置
+        optimizer = tf.keras.optimizers.Adam(
+            learning_rate=initial_learning_rate,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-7
+        )
+        
+        # 编译模型
+        model.compile(
+            optimizer=optimizer,
+            loss=combined_loss,
+            metrics=[dice_coef, iou_metric]
+        )
+    
+    # 回调函数
     callbacks = [
         ModelCheckpoint(
             'deeplabv3plus_mbv3_best.keras',
@@ -381,71 +382,39 @@ def train():
         ),
         ReduceLROnPlateau(
             monitor='val_loss',
-            factor=0.6,
-            patience=2,  # 更快降低学习率
+            factor=0.5,
+            patience=3,
             min_lr=1e-6,
             verbose=1
         ),
         EarlyStopping(
             monitor='val_loss',
-            patience=6,  # 更早停止
+            patience=8,
             restore_best_weights=True,
             verbose=1
+        ),
+        # 添加TensorBoard回调以监控训练
+        tf.keras.callbacks.TensorBoard(
+            log_dir='./logs',
+            update_freq=50
         )
     ]
-
-    # CPU使用率优化
-    import threading
     
-    # 优化点5: 限制TensorFlow使用的线程数
-    tf.config.threading.set_inter_op_parallelism_threads(4)  # 限制线程池大小
-    tf.config.threading.set_intra_op_parallelism_threads(4)  # 限制操作内并行度
-    
-    # 优化点6: 设置内存增长策略
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    for gpu in gpus:
-        # 显存动态增长，避免一次性分配过多
-        tf.config.experimental.set_memory_growth(gpu, True)
-    
-    # 训练模型
+    # 使用全部数据训练
     history = model.fit(
         train_dataset,
         epochs=EPOCHS,
-        steps_per_epoch=steps_per_epoch,  # 指定训练步数
-        validation_data=val_dataset,      # 验证集是有限的，不需要指定steps
-        callbacks=callbacks
+        steps_per_epoch=steps_per_epoch,
+        validation_data=val_dataset,
+        callbacks=callbacks,
+        verbose=1
     )
-
-    # 绘制训练历史
-    plt.figure(figsize=(15, 5))
-
-    plt.subplot(1, 3, 1)
-    plt.plot(history.history['loss'], label='Train Loss')
-    plt.plot(history.history['val_loss'], label='Val Loss')
-    plt.legend()
-    plt.title('Loss')
-
-    plt.subplot(1, 3, 2)
-    plt.plot(history.history['dice_coef'], label='Train Dice')
-    plt.plot(history.history['val_dice_coef'], label='Val Dice')
-    plt.legend()
-    plt.title('Dice Coefficient')
-
-    plt.subplot(1, 3, 3)
-    plt.plot(history.history['iou_metric'], label='Train IoU')
-    plt.plot(history.history['val_iou_metric'], label='Val IoU')
-    plt.legend()
-    plt.title('IoU')
-
-    plt.tight_layout()
-    plt.savefig('training_history.png')
-    plt.show()
-
+    
     # 保存模型
     model.save('deeplabv3plus_mbv3_final.keras')
     print("模型训练完成并保存")
     
-    return train_dataset  # 返回训练数据集供convert函数使用
+    return train_dataset
 
 def convert():
     print("开始转换TFLite模型...")
@@ -627,40 +596,26 @@ if __name__ == "__main__":
     
     # 分割训练和验证集
     train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = train_test_split(
-        image_paths, mask_paths, test_size=0.2, random_state=42)
+        image_paths, mask_paths, test_size=0.15, random_state=42)  # 减少验证集比例以增加训练集
     
-    # 计算steps_per_epoch
-    steps_per_epoch = len(train_img_paths) // BATCH_SIZE
+    # 计算steps_per_epoch - 考虑多卡训练
+    steps_per_epoch = len(train_img_paths) // (BATCH_SIZE * 4)  # 4个GPU
     steps_per_epoch = max(1, steps_per_epoch)
     
     print(f"训练集大小: {len(train_img_paths)}")
     print(f"验证集大小: {len(val_img_paths)}")
     print(f"每轮训练步数: {steps_per_epoch}")
     
-    # 创建数据集时指定sharding
-    options = tf.data.Options()
-    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
-    
+    # 创建分布式训练优化的数据集
     train_dataset = create_dataset(train_img_paths, train_mask_paths, training=True)
-    train_dataset = train_dataset.with_options(options)
-    
     val_dataset = create_dataset(val_img_paths, val_mask_paths, training=False)
-    val_dataset = val_dataset.with_options(options)
     
-    # 在数据加载部分添加一个简单的过滤器减少训练数据量进行测试
-    if TRAIN_LEN == 0:  # 如果未指定训练长度
-        # 可以先设置一个较小的子集进行测试
-        TRAIN_SUBSET = 1000  # 先用1000张图像训练测试速度
-        if len(train_img_paths) > TRAIN_SUBSET:
-            train_img_paths = train_img_paths[:TRAIN_SUBSET]
-            train_mask_paths = train_mask_paths[:TRAIN_SUBSET]
+    # 使用全部训练数据
+    # 无需限制TRAIN_SUBSET - 强大硬件可以处理全部数据
     
     # 训练模型
     train()
     
-    # 转换为TFLite
-    # convert()
-    convert_test()
-    
-    # 测试TFLite模型
-    test_tflite_model()
+    # 转换为TFLite并测试
+    convert()
+    test_tflite_model('doc_scanner_mbv3_test.tflite')  # 使用完全量化的模型
