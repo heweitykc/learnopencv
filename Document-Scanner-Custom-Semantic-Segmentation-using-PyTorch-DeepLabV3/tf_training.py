@@ -330,6 +330,9 @@ def train():
     # 启用XLA加速 - 优化V100性能
     tf.config.optimizer.set_jit(True)
     
+    # 定义AUTOTUNE常量 - 添加这一行
+    AUTOTUNE = tf.data.AUTOTUNE
+    
     # 检查GPU配置 - 适应单V100
     physical_devices = tf.config.list_physical_devices('GPU')
     if physical_devices:
@@ -523,10 +526,20 @@ def convert_production(model=None):
         tf.lite.OpsSet.SELECT_TF_OPS
     ]
     
-    # 只使用10张图像进行量化 - 减少时间但仍保持质量
-    def create_minimal_dataset_for_quantization():
+    # 优化代表性的校准数据选择
+    def create_diverse_calibration_dataset():
         global train_img_paths
-        paths = train_img_paths[:10]  # 从100减少到10张
+        
+        # 手动选择具有代表性的图像索引
+        # 确保包含不同光照、背景、文档类型和角度的样本
+        diverse_indices = [10, 50, 100, 150, 200, 250, 300, 350, 400, 450]
+        
+        # 如果没有具体索引，尝试通过采样获得多样性
+        if len(train_img_paths) > 100:
+            step = len(train_img_paths) // 10
+            diverse_indices = [i * step for i in range(10)]
+        
+        diverse_paths = [train_img_paths[i] for i in diverse_indices]
         
         def preprocess_image(img_path):
             image = tf.io.read_file(img_path)
@@ -535,13 +548,13 @@ def convert_production(model=None):
             image = tf.cast(image, tf.float32) / 255.0
             return image
             
-        dataset = tf.data.Dataset.from_tensor_slices(paths)
+        dataset = tf.data.Dataset.from_tensor_slices(diverse_paths)
         dataset = dataset.map(preprocess_image)
         dataset = dataset.batch(1)
         return dataset
     
     # 使用最小数据集进行量化
-    simple_dataset = create_minimal_dataset_for_quantization()
+    simple_dataset = create_diverse_calibration_dataset()
     def representative_dataset():
         for image in simple_dataset:
             yield [image]
