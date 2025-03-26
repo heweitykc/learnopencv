@@ -17,9 +17,9 @@ VAL_LEN = 0
 EPOCHS = 50
 NUM_CLASSES = 2
 
-# 双T4 * 2, 32GB总显存, 48核CPU, 186GB内存优化参数
-IMG_SIZE = 384  # T4显存充足，可以支持更高分辨率
-BATCH_SIZE = 32  # 每个T4分配16张图像，总计32
+# V100 * 1, 32GB显存, 12核CPU, 92GB内存优化参数
+IMG_SIZE = 512  # V100显存32GB，提高分辨率获得更好精度
+BATCH_SIZE = 64  # V100计算能力强，可以处理更大批量
 
 # 发布参数
 # TRAIN_LEN = 0
@@ -94,30 +94,26 @@ def create_dataset(image_paths, mask_paths, training=True):
     
     # 将路径转换为tf.data.Dataset格式
     dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
-    
-    # 添加缓存以减少I/O瓶颈
     dataset = dataset.cache()
     
-    # 启用确定性操作以提高性能
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
     options.deterministic = False
-    options.experimental_optimization.map_parallelization = True  # 启用并行映射优化
+    options.experimental_optimization.map_parallelization = True
     dataset = dataset.with_options(options)
     
-    # 充分利用48核CPU，增加并行处理数量
-    dataset = dataset.map(parse_image, num_parallel_calls=24)  # 使用一半的CPU核心
+    # 调整为12核CPU配置
+    dataset = dataset.map(parse_image, num_parallel_calls=8)  # 只使用8个CPU核心
 
     if training:
-        dataset = dataset.map(data_augmentation, num_parallel_calls=24)
-        # 利用186GB大内存，增大shuffle buffer
-        dataset = dataset.shuffle(buffer_size=5000, reshuffle_each_iteration=True)
+        dataset = dataset.map(data_augmentation, num_parallel_calls=8)
+        # 调整为92GB内存配置
+        dataset = dataset.shuffle(buffer_size=2500, reshuffle_each_iteration=True)  # 减小shuffle buffer
         dataset = dataset.repeat()
         dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)
     else:
         dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)
     
-    # 增大预取缓冲区
     dataset = dataset.prefetch(buffer_size=AUTOTUNE)
     return dataset
 
@@ -309,42 +305,37 @@ def iou_metric(y_true, y_pred, smooth=1e-6):
     return (intersection + smooth) / (union + smooth)
 
 def train():
-    # 启用XLA加速，可提升30%左右性能
+    # 启用XLA加速
     tf.config.optimizer.set_jit(True)
     
-    # 检查并设置GPU内存增长
+    # GPU内存增长设置
     physical_devices = tf.config.list_physical_devices('GPU')
     if physical_devices:
         for device in physical_devices:
             tf.config.experimental.set_memory_growth(device, True)
+        print(f"使用GPU: {[device.name for device in physical_devices]}")
     
-    # 明确指定使用两个GPU
-    strategy = tf.distribute.MirroredStrategy()
-    print(f'Number of devices: {strategy.num_replicas_in_sync}')
+    # 直接创建模型，不使用strategy.scope()
+    model = DeepLabV3Plus()
     
-    with strategy.scope():
-        model = DeepLabV3Plus()
-        
-        # T4性能不如V100，适当调整学习率
-        initial_learning_rate = 3e-4
-        optimizer = tf.keras.optimizers.Adam(learning_rate=initial_learning_rate)
-        
-        # 启用混合精度训练以提高性能
-        policy = tf.keras.mixed_precision.Policy('mixed_float16')
-        tf.keras.mixed_precision.set_global_policy(policy)
-        
-        # 添加优化器配置，使用混合精度更有效
-        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(
-            tf.keras.optimizers.Adam(learning_rate=initial_learning_rate)
-        )
-        
-        # 编译时添加优化器配置
-        model.compile(
-            optimizer=optimizer,
-            loss=combined_loss,
-            metrics=[dice_coef, iou_metric],
-            # 不添加steps_per_execution避免兼容性问题
-        )
+    # V100性能强劲，使用更大的学习率
+    initial_learning_rate = 5e-4  # 提高学习率加速收敛
+    
+    # 启用混合精度训练
+    policy = tf.keras.mixed_precision.Policy('mixed_float16')
+    tf.keras.mixed_precision.set_global_policy(policy)
+    
+    # 使用LossScaleOptimizer以充分利用V100的Tensor Cores
+    optimizer = tf.keras.mixed_precision.LossScaleOptimizer(
+        tf.keras.optimizers.Adam(learning_rate=initial_learning_rate)
+    )
+    
+    # 编译模型
+    model.compile(
+        optimizer=optimizer,
+        loss=combined_loss,
+        metrics=[dice_coef, iou_metric]
+    )
 
     # 更激进的回调函数设置
     callbacks = [
