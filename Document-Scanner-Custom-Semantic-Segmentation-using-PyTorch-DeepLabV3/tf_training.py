@@ -31,11 +31,11 @@ tf.config.threading.set_intra_op_parallelism_threads(6)  # 预留部分核心给
 # 模型训练参数 - 针对V100单卡 + 12核CPU优化
 TRAIN_LEN = 0
 VAL_LEN = 0
-EPOCHS = 50
+EPOCHS = 3
 NUM_CLASSES = 2
 
 # 优化的硬件参数
-IMG_SIZE = 448      # 增大到448x448，充分利用32GB显存提高精度
+IMG_SIZE = 384      # 增大到448x448，充分利用32GB显存提高精度
 BATCH_SIZE = 24     # 针对12核CPU限制的适中批量
 
 # GPU配置优化
@@ -331,13 +331,8 @@ def train():
     physical_devices = tf.config.list_physical_devices('GPU')
     if physical_devices:
         print(f"训练将使用 {len(physical_devices)} 个GPU")
-        # 修复GPU内存信息获取问题
-        try:
-            # 直接输出设备信息，不尝试获取内存信息
-            for i, device in enumerate(physical_devices):
-                print(f"  GPU #{i}: {device.name}")
-        except Exception as e:
-            print(f"无法获取GPU内存信息: {e}")
+        for i, device in enumerate(physical_devices):
+            print(f"  GPU #{i}: {device.name}")
     else:
         print("警告: 未检测到GPU，训练将使用CPU")
     
@@ -347,7 +342,7 @@ def train():
     # 模型创建
     model = DeepLabV3Plus()
     
-    # 优化器配置 - 针对V100和混合精度训练
+    # 优化器配置
     optimizer = tf.keras.optimizers.Adam(
         learning_rate=initial_learning_rate,
         beta_1=0.9,
@@ -362,18 +357,19 @@ def train():
         metrics=[dice_coef, iou_metric]
     )
     
-    # 回调函数优化
+    # 回调函数
     callbacks = [
         ModelCheckpoint(
-            'deeplabv3plus_mbv3_best.keras',
+            'deeplabv3plus_mbv3_best_weights.h5',  # 只保存权重而不是整个模型
             monitor='val_iou_metric',
             mode='max',
             save_best_only=True,
-            verbose=1
+            verbose=1,
+            save_weights_only=True  # 关键修改：只保存权重
         ),
         ReduceLROnPlateau(
             monitor='val_loss',
-            factor=0.7,  # 更温和的学习率调整
+            factor=0.7,
             patience=3,
             min_lr=5e-6,
             verbose=1
@@ -384,53 +380,77 @@ def train():
             restore_best_weights=True,
             verbose=1
         ),
-        # 添加TensorBoard回调以监控训练
         tf.keras.callbacks.TensorBoard(
             log_dir='./logs',
-            update_freq=100,  # 减少写入频率降低IO负担
-            profile_batch=0  # 禁用分析以提高性能
+            update_freq=100,
+            profile_batch=0
         )
     ]
     
-    # 训练模型 - 使用优化数据集，且移除不支持的选项
+    # 注意：为了避免与options相关的问题，我们重新创建一个没有options的数据集
+    # 这是一个临时解决方案，只为了训练过程
+    def create_simple_training_dataset():
+        global train_img_paths, train_mask_paths
+        
+        # 创建简单数据集，不使用options
+        dataset = tf.data.Dataset.from_tensor_slices((train_img_paths, train_mask_paths))
+        dataset = dataset.shuffle(buffer_size=1000)
+        dataset = dataset.map(parse_image, num_parallel_calls=4)
+        dataset = dataset.map(optimized_data_augmentation, num_parallel_calls=4)
+        dataset = dataset.batch(BATCH_SIZE)
+        dataset = dataset.repeat()
+        dataset = dataset.prefetch(buffer_size=2)
+        return dataset
+    
+    def create_simple_validation_dataset():
+        global val_img_paths, val_mask_paths
+        
+        # 创建简单验证数据集
+        dataset = tf.data.Dataset.from_tensor_slices((val_img_paths, val_mask_paths))
+        dataset = dataset.map(parse_image, num_parallel_calls=2)
+        dataset = dataset.batch(BATCH_SIZE)
+        dataset = dataset.prefetch(buffer_size=1)
+        return dataset
+    
+    # 创建没有options的简单数据集
+    simple_train_dataset = create_simple_training_dataset()
+    simple_val_dataset = create_simple_validation_dataset()
+    
+    # 训练模型
     print("\n开始训练模型...")
     history = model.fit(
-        train_dataset,
+        simple_train_dataset,
         epochs=EPOCHS,
         steps_per_epoch=steps_per_epoch,
-        validation_data=val_dataset,
+        validation_data=simple_val_dataset,
         callbacks=callbacks,
         verbose=1
     )
     
-    # 保存模型 - 使用更简单的保存方式
-    try:
-        print("保存最终模型...")
-        model.save('deeplabv3plus_mbv3_final.keras', save_format='keras_v3')
-    except Exception as e:
-        print(f"保存模型时出错: {e}")
-        # 尝试使用备选方案
-        model.save_weights('deeplabv3plus_mbv3_final_weights.h5')
-        print("已保存模型权重")
+    # 只保存权重，避免复杂模型保存问题
+    model.save_weights('deeplabv3plus_mbv3_final_weights.h5')
+    print("模型权重已保存")
     
-    print("模型训练完成")
+    # 保存最佳权重的模型用于TFLite转换
+    model.load_weights('deeplabv3plus_mbv3_best_weights.h5')
+    print("已加载最佳模型权重")
     
-    return train_dataset
+    return model  # 返回加载了最佳权重的模型
 
-# TFLite转换函数保持基本不变
-def convert():
+# TFLite转换函数修改为接收训练好的模型
+def convert(model=None):
     print("开始转换TFLite模型...")
-    # 加载最佳模型
-    model = tf.keras.models.load_model(
-        'deeplabv3plus_mbv3_best.keras',
-        custom_objects={
-            'dice_coef': dice_coef,
-            'dice_loss': dice_loss,
-            'binary_focal_loss': binary_focal_loss,
-            'combined_loss': combined_loss,
-            'iou_metric': iou_metric
-        }
-    )
+    
+    # 如果没有传入模型，尝试重新创建一个并加载权重
+    if model is None:
+        print("未传入模型，尝试创建新模型并加载权重...")
+        model = DeepLabV3Plus()
+        try:
+            model.load_weights('deeplabv3plus_mbv3_best_weights.h5')
+            print("成功加载模型权重")
+        except Exception as e:
+            print(f"加载模型权重失败: {e}")
+            return None
 
     # 创建推断模型
     input_tensor = tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
@@ -438,7 +458,7 @@ def convert():
     outputs = tf.keras.layers.Activation('sigmoid')(outputs)
     inference_model = tf.keras.Model(inputs=input_tensor, outputs=outputs)
 
-    # TFLite转换配置
+    # TFLite转换配置 - 保持原样
     converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.target_spec.supported_ops = [
@@ -446,12 +466,30 @@ def convert():
         tf.lite.OpsSet.SELECT_TF_OPS
     ]
     
-    # 量化配置 - 利用训练数据集
+    # 这里我们需要重新创建一个简单的数据集用于量化
+    def create_simple_dataset_for_quantization():
+        global train_img_paths
+        # 只选择一小部分图像以加快处理
+        paths = train_img_paths[:100]
+        
+        # 创建一个简单的数据集只用于读取图像
+        def preprocess_image(img_path):
+            image = tf.io.read_file(img_path)
+            image = tf.image.decode_jpeg(image, channels=3)
+            image = tf.image.resize(image, [IMG_SIZE, IMG_SIZE])
+            image = tf.cast(image, tf.float32) / 255.0
+            return image
+            
+        dataset = tf.data.Dataset.from_tensor_slices(paths)
+        dataset = dataset.map(preprocess_image)
+        dataset = dataset.batch(1)
+        return dataset
+    
+    # 量化配置 - 使用简单数据集
+    simple_dataset = create_simple_dataset_for_quantization()
     def representative_dataset():
-        for image_batch, _ in train_dataset.take(100):
-            for image in image_batch:
-                image = tf.expand_dims(image, axis=0)
-                yield [image]
+        for image in simple_dataset:
+            yield [image]
 
     converter.representative_dataset = representative_dataset
     converter.inference_input_type = tf.uint8
@@ -461,28 +499,23 @@ def convert():
     print("正在转换模型(可能需要几分钟)...")
     tflite_model = converter.convert()
     
-    # 保存模型
+    # 保存模型 - 保持原样
     with open('doc_scanner_mbv3.tflite', 'wb') as f:
         f.write(tflite_model)
     print("TFLite模型已保存")
     print(f"TFLite模型大小: {len(tflite_model) / (1024 * 1024):.2f} MB")
     
-    # 添加保存到指定目录的功能，并在文件名中加入时间戳
+    # 保存到时间戳目录
     import os
     import datetime
     
-    # 创建保存目录
     save_dir = "/mnt/data/scan/"
     os.makedirs(save_dir, exist_ok=True)
     
-    # 获取当前时间并格式化为字符串
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # 构建带时间戳的文件名
     tflite_filename = f"doc_scanner_mbv3_{current_time}.tflite"
     tflite_filepath = os.path.join(save_dir, tflite_filename)
     
-    # 保存模型到指定目录
     with open(tflite_filepath, 'wb') as f:
         f.write(tflite_model)
     
@@ -519,11 +552,11 @@ if __name__ == "__main__":
     train_dataset = create_dataset(train_img_paths, train_mask_paths, training=True)
     val_dataset = create_dataset(val_img_paths, val_mask_paths, training=False)
     
-    # 训练模型
+    # 训练模型并获取训练好的模型
     print("\n配置完成，开始训练...")
-    train()
+    trained_model = train()
     
-    # 转换为TFLite
-    convert()
+    # 转换为TFLite - 传入训练好的模型
+    convert(trained_model)
     
     print("\n=== 训练和转换过程完成 ===")
