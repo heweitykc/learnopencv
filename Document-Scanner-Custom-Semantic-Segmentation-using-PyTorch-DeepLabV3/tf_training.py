@@ -437,9 +437,9 @@ def train():
     
     return model  # 返回加载了最佳权重的模型
 
-# TFLite转换函数修改为接收训练好的模型
+# 优化的convert函数 - 大幅提高速度，适合开发环境
 def convert(model=None):
-    print("开始转换TFLite模型...")
+    print("开始转换TFLite模型(动态范围量化)...")
     
     # 如果没有传入模型，尝试重新创建一个并加载权重
     if model is None:
@@ -458,54 +458,26 @@ def convert(model=None):
     outputs = tf.keras.layers.Activation('sigmoid')(outputs)
     inference_model = tf.keras.Model(inputs=input_tensor, outputs=outputs)
 
-    # TFLite转换配置 - 保持原样
+    # 使用更快的动态范围量化 - 不需要representative_dataset
     converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]  # 仍保留优化但使用动态范围量化
+    
+    # 支持的操作和平台
     converter.target_spec.supported_ops = [
         tf.lite.OpsSet.TFLITE_BUILTINS,
         tf.lite.OpsSet.SELECT_TF_OPS
     ]
     
-    # 这里我们需要重新创建一个简单的数据集用于量化
-    def create_simple_dataset_for_quantization():
-        global train_img_paths
-        # 只选择一小部分图像以加快处理
-        paths = train_img_paths[:100]
-        
-        # 创建一个简单的数据集只用于读取图像
-        def preprocess_image(img_path):
-            image = tf.io.read_file(img_path)
-            image = tf.image.decode_jpeg(image, channels=3)
-            image = tf.image.resize(image, [IMG_SIZE, IMG_SIZE])
-            image = tf.cast(image, tf.float32) / 255.0
-            return image
-            
-        dataset = tf.data.Dataset.from_tensor_slices(paths)
-        dataset = dataset.map(preprocess_image)
-        dataset = dataset.batch(1)
-        return dataset
-    
-    # 量化配置 - 使用简单数据集
-    simple_dataset = create_simple_dataset_for_quantization()
-    def representative_dataset():
-        for image in simple_dataset:
-            yield [image]
-
-    converter.representative_dataset = representative_dataset
-    converter.inference_input_type = tf.uint8
-    converter.inference_output_type = tf.uint8
-
-    # 执行转换
-    print("正在转换模型(可能需要几分钟)...")
+    print("正在转换模型(使用动态范围量化)...")
     tflite_model = converter.convert()
     
-    # 保存模型 - 保持原样
+    # 保存模型
     with open('doc_scanner_mbv3.tflite', 'wb') as f:
         f.write(tflite_model)
     print("TFLite模型已保存")
     print(f"TFLite模型大小: {len(tflite_model) / (1024 * 1024):.2f} MB")
     
-    # 保存到时间戳目录
+    # 保存到指定目录
     import os
     import datetime
     
@@ -522,6 +494,90 @@ def convert(model=None):
     print(f"TFLite模型已保存到: {tflite_filepath}")
 
     return 'doc_scanner_mbv3.tflite'
+
+# 保留完整量化的函数 - 仅用于最终产品发布
+def convert_production(model=None):
+    print("开始生成生产版TFLite模型(完整INT8量化)...")
+    
+    if model is None:
+        print("未传入模型，尝试创建新模型并加载权重...")
+        model = DeepLabV3Plus()
+        try:
+            model.load_weights('deeplabv3plus_mbv3_best_weights.h5')
+            print("成功加载模型权重")
+        except Exception as e:
+            print(f"加载模型权重失败: {e}")
+            return None
+
+    # 创建推断模型
+    input_tensor = tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+    outputs = model(input_tensor)
+    outputs = tf.keras.layers.Activation('sigmoid')(outputs)
+    inference_model = tf.keras.Model(inputs=input_tensor, outputs=outputs)
+
+    # 完整量化配置
+    converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS,
+        tf.lite.OpsSet.SELECT_TF_OPS
+    ]
+    
+    # 只使用10张图像进行量化 - 减少时间但仍保持质量
+    def create_minimal_dataset_for_quantization():
+        global train_img_paths
+        paths = train_img_paths[:10]  # 从100减少到10张
+        
+        def preprocess_image(img_path):
+            image = tf.io.read_file(img_path)
+            image = tf.image.decode_jpeg(image, channels=3)
+            image = tf.image.resize(image, [IMG_SIZE, IMG_SIZE])
+            image = tf.cast(image, tf.float32) / 255.0
+            return image
+            
+        dataset = tf.data.Dataset.from_tensor_slices(paths)
+        dataset = dataset.map(preprocess_image)
+        dataset = dataset.batch(1)
+        return dataset
+    
+    # 使用最小数据集进行量化
+    simple_dataset = create_minimal_dataset_for_quantization()
+    def representative_dataset():
+        for image in simple_dataset:
+            yield [image]
+
+    converter.representative_dataset = representative_dataset
+    converter.inference_input_type = tf.uint8
+    converter.inference_output_type = tf.uint8
+
+    # 执行转换
+    print("正在转换生产版模型(可能需要几分钟)...")
+    tflite_model = converter.convert()
+    
+    # 保存模型
+    production_path = 'doc_scanner_mbv3_production.tflite'
+    with open(production_path, 'wb') as f:
+        f.write(tflite_model)
+    print(f"生产版TFLite模型已保存: {production_path}")
+    print(f"生产版模型大小: {len(tflite_model) / (1024 * 1024):.2f} MB")
+    
+    # 保存到指定目录
+    import os
+    import datetime
+    
+    save_dir = "/mnt/data/scan/"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    tflite_filename = f"doc_scanner_mbv3_production_{current_time}.tflite"
+    tflite_filepath = os.path.join(save_dir, tflite_filename)
+    
+    with open(tflite_filepath, 'wb') as f:
+        f.write(tflite_model)
+    
+    print(f"生产版TFLite模型已保存到: {tflite_filepath}")
+
+    return production_path
 
 # 非量化TFLite转换函数 - 用于快速测试
 def convert_test(model=None):
@@ -615,12 +671,16 @@ if __name__ == "__main__":
     print("\n配置完成，开始训练...")
     trained_model = train()
     
-    # 转换为无量化的测试TFLite模型 - 快速测试用
-    print("\n转换为测试TFLite模型(无量化)...")
-    test_model_path = convert_test(trained_model)
+    # 转换为测试版模型 - 无量化，超快
+    # print("\n转换为测试TFLite模型(无量化)...")
+    # test_model_path = convert_test(trained_model)
     
-    # 转换为标准TFLite - 带量化，可选，根据需要注释掉
-    # print("\n转换为标准TFLite模型(带量化)...")
-    # convert(trained_model)
+    # 转换为开发版模型 - 使用动态范围量化，速度适中
+    print("\n转换为开发版TFLite模型(动态范围量化)...")
+    dev_model_path = convert(trained_model)
+    
+    # 如果需要生产版模型，可以取消注释下面的代码
+    # print("\n转换为生产版TFLite模型(完整INT8量化)...")
+    # prod_model_path = convert_production(trained_model)
     
     print("\n=== 训练和转换过程完成 ===")
