@@ -6,13 +6,18 @@ import glob
 import random
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
+import datetime
+
+# 设置TensorFlow环境变量（与训练代码一致）
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 减少日志输出
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # 动态显存分配
 
 # 数据集路径 - 确保与训练时使用的路径一致
 IMAGE_DIR = '/mnt/data/scan/document_dataset_resized/train/images'
 MASK_DIR = '/mnt/data/scan/document_dataset_resized/train/masks'
 
 # 确保与训练时一致的图像尺寸
-IMG_SIZE = 384
+IMG_SIZE = 416  # 与训练代码保持一致
 
 # 设置全局字体
 def set_matplotlib_chinese_font():
@@ -56,25 +61,30 @@ def load_model(model_path="/mnt/data/scan/doc_scanner_mbv3.tflite"):
             print(f"目录 {data_dir} 不存在")
             return None
     
-    interpreter = tf.lite.Interpreter(model_path=model_path)
-    interpreter.allocate_tensors()
-    
-    # 获取模型详情
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-    
-    print("模型信息:")
-    print(f"  输入: {input_details[0]['shape']} ({input_details[0]['dtype']})")
-    print(f"  输出: {output_details[0]['shape']} ({output_details[0]['dtype']})")
-    
-    return interpreter, input_details, output_details
+    # 创建解释器实例
+    try:
+        interpreter = tf.lite.Interpreter(model_path=model_path)
+        interpreter.allocate_tensors()
+        
+        # 获取模型详情
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        
+        print("模型信息:")
+        print(f"  输入: {input_details[0]['shape']} ({input_details[0]['dtype']})")
+        print(f"  输出: {output_details[0]['shape']} ({output_details[0]['dtype']})")
+        
+        return interpreter, input_details, output_details
+    except Exception as e:
+        print(f"加载模型失败: {e}")
+        return None
 
-# 预处理图像
+# 预处理图像 - 保持与训练代码一致
 def preprocess_image(image_path):
     img = cv2.imread(image_path)
     if img is None:
         print(f"无法读取图像: {image_path}")
-        return None
+        return None, None
     
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     original_img = img.copy()  # 保存原始图像用于显示
@@ -82,16 +92,19 @@ def preprocess_image(image_path):
     # 调整大小以适应模型输入
     img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
     
-    # 保持为uint8类型，不做归一化处理
-    img = img.astype(np.uint8)
+    # 转换为float32并归一化为0-1范围
+    # 训练时使用float32归一化，TFLite模型也期望接收float32
+    img = img.astype(np.float32) / 255.0
     
     return img, original_img
 
 # 后处理输出
 def postprocess_output(output, original_shape):
-    # 处理uint8输出
+    # 处理不同数据类型的输出
     if output.dtype == np.uint8:
         output = output.astype(np.float32) / 255.0
+    elif output.dtype == np.float16:  # 处理float16输出
+        output = output.astype(np.float32)
     
     # 获取掩码并调整为原始图像大小
     mask = output[0, :, :, 0]  # 获取第一个通道
@@ -135,23 +148,27 @@ def predict(interpreter, input_details, output_details, image_path):
     # 准备输入数据
     input_tensor = np.expand_dims(img, axis=0)
     
-    # 设置输入张量
-    interpreter.set_tensor(input_details[0]['index'], input_tensor)
-    
-    # 禁用TF-Flex代理，只使用CPU执行
-    os.environ["TENSORFLOW_DISABLE_FLEX_DELEGATE"] = "1"
-    
-    # 执行推理
-    print("执行推理...")
-    interpreter.invoke()
-    
-    # 获取输出
-    output = interpreter.get_tensor(output_details[0]['index'])
-    
-    # 后处理
-    mask = postprocess_output(output, original_img.shape)
-    
-    return mask, original_img
+    try:
+        # 设置输入张量
+        interpreter.set_tensor(input_details[0]['index'], input_tensor)
+        
+        # 尝试禁用TF-Flex代理，避免类型错误
+        os.environ["TENSORFLOW_DISABLE_FLEX_DELEGATE"] = "1"
+        
+        # 执行推理
+        print("执行推理...")
+        interpreter.invoke()
+        
+        # 获取输出
+        output = interpreter.get_tensor(output_details[0]['index'])
+        
+        # 后处理
+        mask = postprocess_output(output, original_img.shape)
+        
+        return mask, original_img
+    except Exception as e:
+        print(f"推理失败: {e}")
+        return None, None
 
 # 可视化结果
 def visualize_results(original_img, predicted_mask, ground_truth_mask=None):
@@ -196,62 +213,21 @@ def visualize_results(original_img, predicted_mask, ground_truth_mask=None):
     # 保存图像
     output_dir = "test_results"
     os.makedirs(output_dir, exist_ok=True)
-    plt.savefig(os.path.join(output_dir, "test_result.png"))
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    plt.savefig(os.path.join(output_dir, f"test_result_{timestamp}.png"))
     
     plt.show()
 
-# 添加一个测试转换函数，跳过模型推理
-def convert_test(image_path, fake_segmentation=True):
-    """
-    用于测试的转换函数，跳过TFLite模型推理
-    
-    参数:
-        image_path: 图像路径
-        fake_segmentation: 是否生成伪分割掩码
-    
-    返回:
-        mask: 生成的掩码
-        original_img: 原始图像
-    """
-    print("使用测试转换函数而非模型推理...")
-    
-    # 读取和预处理图像
-    img = cv2.imread(image_path)
-    if img is None:
-        print(f"无法读取图像: {image_path}")
-        return None, None
-    
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    original_img = img.copy()
-    
-    if fake_segmentation:
-        # 创建简单的测试掩码 - 使用简单的图像处理代替模型推理
-        # 转为灰度
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        # 使用自适应阈值
-        mask = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY_INV, 11, 2
-        )
-        
-        # 进行一些形态学操作来模拟分割结果
-        kernel = np.ones((5,5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        
-        # 二值化
-        mask = (mask > 0).astype(np.uint8)
-    else:
-        # 如果不需要伪分割，只返回全黑掩码
-        mask = np.zeros((original_img.shape[0], original_img.shape[1]), dtype=np.uint8)
-    
-    return mask, original_img
-
-# 修改main函数
+# 主函数
 def main():
-    # 加载模型 - 仍然保留这一步以获取模型信息
+    print("\n=== 开始文档扫描分割测试 ===")
+    print(f"TensorFlow版本: {tf.__version__}")
+    print(f"测试分辨率: {IMG_SIZE}x{IMG_SIZE}")
+    
+    # 加载模型
     model_result = load_model()
     if model_result is None:
+        print("模型加载失败，无法继续测试")
         return
     
     interpreter, input_details, output_details = model_result
@@ -263,12 +239,10 @@ def main():
     
     print(f"测试图像: {image_path}")
     
-    # 使用替代函数而不是predict
-    predicted_mask, original_img = convert_test(image_path)
-    # 如果想尝试原始predict函数，可取消下行注释
-    # predicted_mask, original_img = predict(interpreter, input_details, output_details, image_path)
-    
-    if predicted_mask is None:
+    # 执行预测
+    predicted_mask, original_img = predict(interpreter, input_details, output_details, image_path)
+    if predicted_mask is None or original_img is None:
+        print("推理失败，无法生成预测结果")
         return
     
     # 加载真实掩码（如果有）
@@ -282,4 +256,4 @@ def main():
     print("测试完成!")
 
 if __name__ == "__main__":
-    main()
+    main() 
